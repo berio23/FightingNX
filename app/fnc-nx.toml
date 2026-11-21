@@ -1,0 +1,39 @@
+# fnc-nx PC dev bench settings (ReXGlue cvars). The build copies this file next to the executable when there is none
+# there yet; edit the copy. Any cvar can also be given on the command line (--name=value) or as REX_<NAME>.
+#
+# The game/GPU keys are FNC Reborn's dist/FNCReborn.toml (commit 7f68ee3), so this bench and FNCReborn.exe run the same
+# configuration for frame-by-frame comparisons. Differences, on purpose: windowed + muted + minimized (test runs never
+# take over the desktop), resolution_scale 1 (record FNCReborn.exe at the same scale when comparing), the log in
+# logs\ (the SDK default, read by tools\win\boot_test.ps1).
+
+# Save and cache folders cannot be set here: the SDK reads them before it loads this file. They go on the command
+# line (--user_data_root=..., --cache_root=...); comparison runs pass an empty folder (tools/win/boot_test.ps1
+# -ExeArgs). Without them the saves are in Documents\fnc-nx (this bench's own folder, never FNC Reborn's).
+
+gpu_plugin = "xenos"
+gpu_backend = "d3d12"
+log_level = "info"
+
+audio_mute = true
+window_start_minimized = true
+fullscreen = false
+
+# FNC Reborn's game and GPU settings.
+fnc_frame_rate = 60
+vsync = false
+resolution_scale = 1
+swap_post_effect = "fxaa"
+gpu_allow_invalid_fetch_constants = true
+render_target_path_d3d12 = "rtv"
+use_fuzzy_alpha_epsilon = true
+gamma_render_target_as_unorm16 = true
+native_2x_msaa = false
+d3d12_readback_resolve = false
+readback_resolve = "smart"
+readback_resolve_smart_skip_steady = true
+primitive_processor_cache_min_indices = 1000000
+texture_cache_memory_limit_soft = 4096
+texture_cache_memory_limit_hard = 6144
+
+# Stage 2: the native renderer (not built in stage 1).
+sa2_renderer_native = false

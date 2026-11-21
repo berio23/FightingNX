@@ -1,0 +1,21 @@
+# ReXGlue recompilation manifest for Fight Night Champion (Xbox 360, 2011; title 45410915, default.xex).
+#
+# Based on FNC Reborn's config/fnc_manifest.toml (commit 7f68ee3, Apache-2.0, see NOTICE.fnc-reborn). Run
+# tools/codegen.ps1: it calls `rexglue codegen fnc_manifest.toml` and the post-codegen steps. The project name sets the
+# prefix of everything generated: generated/default/fnc_{init,pch,funcs}.h, fnc_recomp.N.cpp, target fnc_recomp.
+
+[project]
+name = "fnc"
+sdk_version = "0.10.0"
+# Your own game files (the extracted disc, default.xex at its root; assets/ is git-ignored). Nothing from the game is
+# distributed with this project.
+game_root = "../assets/game_root"
+
+[entrypoint]
+file_path = "../assets/game_root/default.xex"
+out_directory_path = "generated/default"
+
+# The includes are processed before this table, so whatever is set here overrides what is included.
+#   overrides.toml       written by hand: code the automatic function discovery misses, each with its evidence
+#   codegen_flavor.toml  the codegen flavour, written by tools\codegen.ps1 -Flavor (classic = empty)
+includes = ["overrides.toml", "codegen_flavor.toml"]
