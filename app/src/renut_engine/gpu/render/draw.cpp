@@ -5745,24 +5745,24 @@ void ColourReleaseHeldLocked(HostTexture &d) {
 }
 
 // The resolve's copy as ResolveStateLocked makes it for a single-sampled source, 'rect' of the source (host pixels) to
-// (host_x, host_y) of level 0: drawn (deko3d) or copied, then the destination's host levels.
+// (host_x, host_y) of 'level': drawn (deko3d, level 0 slice 0 z 0) or copied, then the destination's host levels (for level 0).
 void CopyColourResolveLocked(HostSurface *surface, HostTexture *dest, const plume::RenderRect &rect, uint32_t host_x,
-                             uint32_t host_y, uint32_t slice, uint32_t z) {
+                             uint32_t host_y, uint32_t level, uint32_t slice, uint32_t z) {
   plume::RenderCommandList *cmd = State().command_list;
   g_bound.framebuffer = nullptr;
-  if (IsDeko3D() && banjo::renut_gpu::DrawResolvesOn() && slice == 0 && z == 0 &&
+  if (IsDeko3D() && banjo::renut_gpu::DrawResolvesOn() && level == 0 && slice == 0 && z == 0 &&
       DrawResolveCopy(surface, dest, rect, host_x, host_y)) {
     // banjo-nx (2026-10-18): drawn, not copied (deko3d).
   } else {
     TransitionSurfaceLocked(surface, plume::RenderTextureLayout::COPY_SOURCE);
     TransitionTextureLocked(dest, plume::RenderTextureLayout::COPY_DEST);
     const plume::RenderBox box(rect.left, rect.top, rect.right, rect.bottom);
-    cmd->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(dest->texture.get(), 0, slice),
+    cmd->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(dest->texture.get(), level, slice),
                            plume::RenderTextureCopyLocation::Subresource(surface->texture.get()), host_x, host_y, z,
                            &box);
   }
   TransitionTextureLocked(dest, plume::RenderTextureLayout::SHADER_READ);
-  if (!dest->extra_levels)
+  if (level != 0 || !dest->extra_levels)
     return;
   const plume::RenderRect dest_rect(int32_t(host_x), int32_t(host_y), int32_t(host_x) + (rect.right - rect.left),
                                     int32_t(host_y) + (rect.bottom - rect.top));
@@ -5809,7 +5809,7 @@ bool ColourMaterialiseLocked(HostTexture &d) {
       banjo::renut_gpu::CountHandOver(5);  // lost: the target changed without a bind (none expected)
       return false;
     }
-    CopyColourResolveLocked(source, &d, WholeHostRect(*source, d), 0, 0, 0, 0);
+    CopyColourResolveLocked(source, &d, WholeHostRect(*source, d), 0, 0, 0, 0, 0);
     return true;
   }
   if (!d.colour_held || !d.colour_current)
@@ -5825,7 +5825,7 @@ bool ColourMaterialiseLocked(HostTexture &d) {
   image.samples = held.samples;
   image.format_word = held.format_word;
   SwapDepthImageLocked(image, held);
-  CopyColourResolveLocked(&image, &d, WholeHostRect(image, d), 0, 0, 0, 0);
+  CopyColourResolveLocked(&image, &d, WholeHostRect(image, d), 0, 0, 0, 0, 0);
   SwapDepthImageLocked(image, held);
   ColourDropHeldLocked(d);
   return true;
@@ -5834,10 +5834,10 @@ bool ColourMaterialiseLocked(HostTexture &d) {
 // A resolve into 'd' left in the target's image when it can be (true). Otherwise (false: the caller copies) a
 // destination still holding other content gets it first when the resolve does not cover it.
 bool ColourHandOverResolveLocked(HostSurface *s, HostTexture *d, const ClearRect &src, i32 dest_x, i32 dest_y,
-                                 u32 slice, u32 z) {
+                                 u32 level, u32 slice, u32 z) {
   const bool whole = src.x1 == 0 && src.y1 == 0 && src.x2 == int32_t(s->width) && src.y2 == int32_t(s->height) &&
                      dest_x == 0 && dest_y == 0;
-  const bool can = ColourHandOverOn() && whole && slice == 0 && z == 0 && s->texture && !s->depth &&
+  const bool can = ColourHandOverOn() && whole && level == 0 && slice == 0 && z == 0 && s->texture && !s->depth &&
                    s->samples == plume::RenderSampleCount::COUNT_1 && d->texture && d->width == s->width &&
                    d->height == s->height && d->scale == s->scale && d->alloc_width == s->scale.Size(s->width) &&
                    d->alloc_height == s->scale.Size(s->height) && d->host_format == s->format &&
@@ -5845,7 +5845,7 @@ bool ColourHandOverResolveLocked(HostSurface *s, HostTexture *d, const ClearRect
                    d->mip_levels == 1 + d->extra_levels && !d->words;  // one guest level (and its host levels)
   if (!can) {
     if (d->colour_from || d->colour_current) {
-      const bool covers = dest_x == 0 && dest_y == 0 && slice == 0 && z == 0 &&
+      const bool covers = dest_x == 0 && dest_y == 0 && level == 0 && slice == 0 && z == 0 &&
                           src.x2 - src.x1 >= int32_t(d->width) && src.y2 - src.y1 >= int32_t(d->height);
       if (covers) {
         ColourUnhandLocked(*d);
@@ -6103,82 +6103,96 @@ void ResolveStateLocked(const u8 *device_state, u32 flags, const ClearRect *sour
       const bool volume = dest->dimension == TextureDimension::Tex3D && !dest->stacked;
       const uint32_t slice = volume ? 0 : dest_slice;
       const uint32_t z = volume ? dest_slice : 0;
-      const bool fits = fit(dest, src);
+      static uint32_t bad_level_logged = 0;
+      const bool level_valid = dest_level < dest->mip_levels;
+      if (!level_valid && LogLimited(bad_level_logged, 8)) {
+        RGPU_WARN("Colour resolve into {:08X} ({}x{} mips {}): dest_level {} out of range", dest_texture_va,
+                  dest->width, dest->height, dest->mip_levels, dest_level);
+      }
+      const bool fits = level_valid && fit(dest, src);
       const uint64_t sig = fits ? ResolveSignature(surface, src, dest_x, dest_y, dest_level, dest_slice) : 0;
       if (fits && banjo::renut_gpu::ResolveSkipOn() && dest->resolve_signature == sig) {
         // banjo-nx (2026-10-19, banjo_renut_resolve_skip): the same resolve of an unchanged source is in dest already.
         banjo::renut_gpu::CountSkippedResolve(false);
       } else if (fits) {
-        dest->resolve_signature = sig;
-        g_bound.framebuffer = nullptr;
-        // The destination is of the surface's scale.
+        // The destination is of the surface's scale, at dest_level.
         plume::RenderRect rect =
             ScaleRect(plume::RenderRect(src.x1, src.y1, src.x2, src.y2), surface->scale);
-        const uint32_t host_x = uint32_t(surface->scale.Coord(dest_x));
-        const uint32_t host_y = uint32_t(surface->scale.Coord(dest_y));
+        const uint32_t level_alloc_w = std::max(1u, dest->alloc_width >> dest_level);
+        const uint32_t level_alloc_h = std::max(1u, dest->alloc_height >> dest_level);
+        const uint32_t host_x = std::min(uint32_t(surface->scale.Coord(dest_x)), level_alloc_w);
+        const uint32_t host_y = std::min(uint32_t(surface->scale.Coord(dest_y)), level_alloc_h);
         // At a fractional scale the source rect, rounded at its own edges, can
-        // pass the destination's host size by a texel.
-        rect.right = std::min(rect.right, rect.left + int32_t(dest->alloc_width - host_x));
-        rect.bottom = std::min(rect.bottom, rect.top + int32_t(dest->alloc_height - host_y));
-        const plume::RenderRect dest_rect(int32_t(host_x), int32_t(host_y),
-                                          int32_t(host_x) + (rect.right - rect.left),
-                                          int32_t(host_y) + (rect.bottom - rect.top));
-        const bool multisampled = surface->samples != plume::RenderSampleCount::COUNT_1;
-        // sa2-nx (2026-10-28, sa2_renut_colour_handover): left in the target's image, or (single-sampled)
-        // copied as before (CopyColourResolveLocked: drawn or copied, then the host levels).
-        if (ColourHandOverResolveLocked(surface, dest, src, dest_x, dest_y, slice, z)) {
-          // banjo::renut_gpu::CountHandOver(0) counted it
-        } else if (!multisampled) {
-          CopyColourResolveLocked(surface, dest, rect, host_x, host_y, slice, z);
-        } else {
-          if (dest->extra_levels && IsVulkan()) {
-            // A destination with host levels takes it through a single-level
-            // target (ResolveStagingLocked): plume's Vulkan resolve writes every
-            // level of its destination (D3D12's writes level 0 only, and
-            // resolves in place below). Without one (device lost) nothing of
-            // the resolve lands.
-            if (HostTexture *staging = ResolveStagingLocked(dest)) {
-              TransitionSurfaceLocked(surface, plume::RenderTextureLayout::RESOLVE_SOURCE);
-              TransitionTextureLocked(staging, plume::RenderTextureLayout::RESOLVE_DEST);
-              cmd->resolveTextureRegion(staging->texture.get(), host_x, host_y,
-                                        surface->texture.get(), &rect);
-              TransitionTextureLocked(staging, plume::RenderTextureLayout::COPY_SOURCE);
-              TransitionTextureLocked(dest, plume::RenderTextureLayout::COPY_DEST);
-              const plume::RenderBox box(dest_rect.left, dest_rect.top, dest_rect.right,
-                                         dest_rect.bottom);
-              cmd->copyTextureRegion(
-                  plume::RenderTextureCopyLocation::Subresource(dest->texture.get(), 0, slice),
-                  plume::RenderTextureCopyLocation::Subresource(staging->texture.get()), host_x,
-                  host_y, z, &box);
-            }
+        // pass the destination level's host size by a texel.
+        rect.right = std::min(rect.right, rect.left + int32_t(level_alloc_w - host_x));
+        rect.bottom = std::min(rect.bottom, rect.top + int32_t(level_alloc_h - host_y));
+        if (rect.right > rect.left && rect.bottom > rect.top) {
+          dest->resolve_signature = sig;
+          g_bound.framebuffer = nullptr;
+          const plume::RenderRect dest_rect(int32_t(host_x), int32_t(host_y),
+                                            int32_t(host_x) + (rect.right - rect.left),
+                                            int32_t(host_y) + (rect.bottom - rect.top));
+          const bool multisampled = surface->samples != plume::RenderSampleCount::COUNT_1;
+          // sa2-nx (2026-10-28, sa2_renut_colour_handover): left in the target's image, or (single-sampled)
+          // copied as before (CopyColourResolveLocked: drawn or copied, then the host levels).
+          if (ColourHandOverResolveLocked(surface, dest, src, dest_x, dest_y, dest_level, slice, z)) {
+            // banjo::renut_gpu::CountHandOver(0) counted it
+          } else if (!multisampled) {
+            CopyColourResolveLocked(surface, dest, rect, host_x, host_y, dest_level, slice, z);
           } else {
-            TransitionSurfaceLocked(surface, plume::RenderTextureLayout::RESOLVE_SOURCE);
-            TransitionTextureLocked(dest, plume::RenderTextureLayout::RESOLVE_DEST);
-            cmd->resolveTextureRegion(dest->texture.get(), host_x, host_y, surface->texture.get(),
-                                      &rect);
-          }
-          TransitionTextureLocked(dest, plume::RenderTextureLayout::SHADER_READ);
-          if (dest->extra_levels && LazyResolveMipsOn()) {
-            // sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips): made where they are read (FlushResolveMipsLocked). The
-            // texture memos and the chain's reused texture words skip BindTextureLocked while g_texture_epoch holds: the
-            // first pending region bumps it, so the next draw that samples the texture binds it (any bind since makes
-            // the levels, so one still pending has had none).
-            const plume::RenderRect &p = dest->mips_rect;
-            if (dest->mips_pending) {
-              dest->mips_rect = plume::RenderRect(std::min(p.left, dest_rect.left), std::min(p.top, dest_rect.top),
-                                                  std::max(p.right, dest_rect.right),
-                                                  std::max(p.bottom, dest_rect.bottom));
+            if ((dest->extra_levels && IsVulkan()) || dest_level > 0 || slice > 0 || z > 0) {
+              // A destination with host levels (Vulkan), or a non-zero mip/slice/depth, takes it through a
+              // single-level target (ResolveStagingLocked): resolveTextureRegion only writes mip 0 slice 0.
+              if (HostTexture *staging = ResolveStagingLocked(dest)) {
+                TransitionSurfaceLocked(surface, plume::RenderTextureLayout::RESOLVE_SOURCE);
+                TransitionTextureLocked(staging, plume::RenderTextureLayout::RESOLVE_DEST);
+                cmd->resolveTextureRegion(staging->texture.get(), host_x, host_y,
+                                          surface->texture.get(), &rect);
+                TransitionTextureLocked(staging, plume::RenderTextureLayout::COPY_SOURCE);
+                TransitionTextureLocked(dest, plume::RenderTextureLayout::COPY_DEST);
+                const plume::RenderBox box(dest_rect.left, dest_rect.top, dest_rect.right,
+                                           dest_rect.bottom);
+                cmd->copyTextureRegion(
+                    plume::RenderTextureCopyLocation::Subresource(dest->texture.get(), dest_level, slice),
+                    plume::RenderTextureCopyLocation::Subresource(staging->texture.get()), host_x,
+                    host_y, z, &box);
+              }
             } else {
-              dest->mips_rect = dest_rect;
-              dest->mips_pending = true;
-              ++g_texture_epoch;
+              TransitionSurfaceLocked(surface, plume::RenderTextureLayout::RESOLVE_SOURCE);
+              TransitionTextureLocked(dest, plume::RenderTextureLayout::RESOLVE_DEST);
+              cmd->resolveTextureRegion(dest->texture.get(), host_x, host_y, surface->texture.get(),
+                                        &rect);
             }
-          } else if (dest->extra_levels) {
-            UpdateResolveMipsLocked(dest, dest_rect);
-            // The draw path binds its own layout, pipeline and viewport again.
-            g_bound.pipeline = nullptr;
-            g_bound.layout = false;
-            g_bound.viewport_set = false;
+            TransitionTextureLocked(dest, plume::RenderTextureLayout::SHADER_READ);
+            if (dest_level == 0 && dest->extra_levels && LazyResolveMipsOn()) {
+              // sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips): made where they are read (FlushResolveMipsLocked). The
+              // texture memos and the chain's reused texture words skip BindTextureLocked while g_texture_epoch holds: the
+              // first pending region bumps it, so the next draw that samples the texture binds it (any bind since makes
+              // the levels, so one still pending has had none).
+              const plume::RenderRect &p = dest->mips_rect;
+              if (dest->mips_pending) {
+                dest->mips_rect = plume::RenderRect(std::min(p.left, dest_rect.left), std::min(p.top, dest_rect.top),
+                                                    std::max(p.right, dest_rect.right),
+                                                    std::max(p.bottom, dest_rect.bottom));
+              } else {
+                dest->mips_rect = dest_rect;
+                dest->mips_pending = true;
+                ++g_texture_epoch;
+              }
+            } else if (dest_level == 0 && dest->extra_levels) {
+              UpdateResolveMipsLocked(dest, dest_rect);
+              // The draw path binds its own layout, pipeline and viewport again.
+              g_bound.pipeline = nullptr;
+              g_bound.layout = false;
+              g_bound.viewport_set = false;
+            }
+          }
+          // fnc-nx (2026-11-21): record this subresource as dirty for lazy CPU readback on lock (sub_82CD95F8).
+          if (dest_level < 32) {
+            if (dest->readback_dirty.size() <= slice)
+              dest->readback_dirty.resize(slice + 1, 0);
+            dest->readback_dirty[slice] |= (1u << dest_level);
+            EnsureResolvePendingReadback(dest->guest_va, TextureFetch::GpuPage(dest->desc[1] >> 12));
           }
         }
       }
@@ -6300,6 +6314,398 @@ bool ReadRenderTargetLocked(const u8 *device_state, u32 source, u32 &width, u32 
   Video::RetireLocked(std::move(output));
   Video::RetireLocked(std::move(readback));
   return read_back;
+}
+
+namespace {
+
+// fnc-nx (2026-11-21): helpers for ReadbackResolvedTextureLocked (GPU resolve -> guest physical memory on lock).
+void InverseSwizzleSlots(u32 swizzle, uint8_t src_for_slot[4]) {
+  for (uint8_t k = 0; k < 4; ++k)
+    src_for_slot[k] = k;
+  bool assigned[4] = {};
+  for (uint32_t c = 0; c < 4; ++c) {
+    const uint32_t s_c = (swizzle >> (c * 3)) & 7u;
+    if (s_c < 4 && !assigned[s_c]) {
+      src_for_slot[s_c] = uint8_t(c);
+      assigned[s_c] = true;
+    }
+  }
+}
+
+uint32_t PackUnormBits(uint8_t value, uint32_t bits) {
+  const uint32_t max_val = (1u << bits) - 1u;
+  return (uint32_t(value) * max_val + 127u) / 255u;
+}
+
+void ReadHostRgba8(const uint8_t *slice_base, uint32_t row_pitch, plume::RenderFormat host_format, uint32_t alloc_w,
+                   uint32_t alloc_h, uint32_t gx, uint32_t gy, uint32_t guest_w, uint32_t guest_h, RenderScale scale,
+                   uint8_t rgba[4]) {
+  if (alloc_w == guest_w && alloc_h == guest_h) {
+    const uint8_t *p = slice_base + size_t(gy) * row_pitch + size_t(gx) * 4;
+    const bool bgra = host_format == plume::RenderFormat::B8G8R8A8_UNORM;
+    rgba[0] = p[bgra ? 2 : 0];
+    rgba[1] = p[1];
+    rgba[2] = p[bgra ? 0 : 2];
+    rgba[3] = p[3];
+    return;
+  }
+  const uint32_t hx0 = std::min(uint32_t(scale.Coord(int32_t(gx))), alloc_w - 1u);
+  const uint32_t hy0 = std::min(uint32_t(scale.Coord(int32_t(gy))), alloc_h - 1u);
+  const uint32_t hx1 = std::clamp(uint32_t(scale.Coord(int32_t(gx + 1u))), hx0 + 1u, alloc_w);
+  const uint32_t hy1 = std::clamp(uint32_t(scale.Coord(int32_t(gy + 1u))), hy0 + 1u, alloc_h);
+  const bool bgra = host_format == plume::RenderFormat::B8G8R8A8_UNORM;
+  uint32_t sum[4] = {};
+  for (uint32_t hy = hy0; hy < hy1; ++hy) {
+    const uint8_t *row = slice_base + size_t(hy) * row_pitch;
+    for (uint32_t hx = hx0; hx < hx1; ++hx) {
+      const uint8_t *p = row + size_t(hx) * 4;
+      sum[0] += p[bgra ? 2 : 0];
+      sum[1] += p[1];
+      sum[2] += p[bgra ? 0 : 2];
+      sum[3] += p[3];
+    }
+  }
+  const uint32_t count = (hx1 - hx0) * (hy1 - hy0);
+  for (uint32_t c = 0; c < 4; ++c)
+    rgba[c] = uint8_t((sum[c] + count / 2u) / count);
+}
+
+void ReadHostRgba16UnormTo8(const uint8_t *slice_base, uint32_t row_pitch, uint32_t alloc_w, uint32_t alloc_h,
+                            uint32_t gx, uint32_t gy, uint32_t guest_w, uint32_t guest_h, RenderScale scale,
+                            uint8_t rgba[4]) {
+  const uint32_t hx = (alloc_w == guest_w) ? gx : std::min(uint32_t(scale.Coord(int32_t(gx))), alloc_w - 1u);
+  const uint32_t hy = (alloc_h == guest_h) ? gy : std::min(uint32_t(scale.Coord(int32_t(gy))), alloc_h - 1u);
+  uint16_t raw[4];
+  std::memcpy(raw, slice_base + size_t(hy) * row_pitch + size_t(hx) * 8, 8);
+  for (uint32_t c = 0; c < 4; ++c)
+    rgba[c] = uint8_t((uint32_t(raw[c]) * 255u + 32767u) / 65535u);
+}
+
+bool SupportsReadbackFormats(plume::RenderFormat host_format, GpuTextureFormat guest_format) {
+  using F = plume::RenderFormat;
+  using T = GpuTextureFormat;
+  const bool host_8 = (host_format == F::R8G8B8A8_UNORM || host_format == F::B8G8R8A8_UNORM);
+  const bool host_16u = (host_format == F::R16G16B16A16_UNORM);
+  switch (guest_format) {
+  case T::Fmt8:
+  case T::Fmt8_A:
+  case T::Fmt8_B:
+  case T::Fmt8_8:
+  case T::Fmt8_8_8_8:
+  case T::Fmt8_8_8_8_A:
+  case T::Fmt8_8_8_8_As16_16_16_16:
+  case T::Fmt5_6_5:
+  case T::Fmt1_5_5_5:
+  case T::Fmt4_4_4_4:
+    return host_8 || host_16u;
+  case T::Fmt2_10_10_10:
+  case T::Fmt2_10_10_10_As16_16_16_16:
+    return host_16u;
+  case T::Fmt16_16_16_16_Float:
+    return host_format == F::R16G16B16A16_FLOAT;
+  case T::Fmt16_16_16_16:
+  case T::Fmt16_16_16_16_Expand:
+    return host_16u || host_format == F::R16G16B16A16_SNORM;
+  case T::Fmt16_16_Float:
+    return host_format == F::R16G16_FLOAT;
+  case T::Fmt16_16:
+  case T::Fmt16_16_Expand:
+    return host_format == F::R16G16_SNORM || host_format == F::R16G16_UNORM;
+  case T::Fmt32_Float:
+    return host_format == F::R32_FLOAT;
+  case T::Fmt32_32_Float:
+    return host_format == F::R32G32_FLOAT;
+  default:
+    return false;
+  }
+}
+
+void PackGuestReadbackRow(const uint8_t *slice_base, uint32_t row_pitch, plume::RenderFormat host_format,
+                          GpuTextureFormat guest_format, const uint8_t src_for_slot[4], uint32_t alloc_w,
+                          uint32_t alloc_h, uint32_t gy, uint32_t guest_w, uint32_t guest_h, RenderScale scale,
+                          uint8_t *out) {
+  using F = plume::RenderFormat;
+  using T = GpuTextureFormat;
+  if (host_format == F::R8G8B8A8_UNORM || host_format == F::B8G8R8A8_UNORM || host_format == F::R16G16B16A16_UNORM) {
+    if (guest_format == T::Fmt2_10_10_10 || guest_format == T::Fmt2_10_10_10_As16_16_16_16) {
+      for (uint32_t x = 0; x < guest_w; ++x) {
+        const uint32_t hx = (alloc_w == guest_w) ? x : std::min(uint32_t(scale.Coord(int32_t(x))), alloc_w - 1u);
+        const uint32_t hy = (alloc_h == guest_h) ? gy : std::min(uint32_t(scale.Coord(int32_t(gy))), alloc_h - 1u);
+        uint16_t raw[4];
+        std::memcpy(raw, slice_base + size_t(hy) * row_pitch + size_t(hx) * 8, 8);
+        const uint32_t v = (uint32_t(raw[src_for_slot[0]] >> 6)) | (uint32_t(raw[src_for_slot[1]] >> 6) << 10) |
+                           (uint32_t(raw[src_for_slot[2]] >> 6) << 20) |
+                           (uint32_t(raw[src_for_slot[3]] >> 14) << 30);
+        std::memcpy(out + size_t(x) * 4, &v, 4);
+      }
+      return;
+    }
+    if (guest_format == T::Fmt16_16_16_16 || guest_format == T::Fmt16_16_16_16_Expand) {
+      for (uint32_t x = 0; x < guest_w; ++x) {
+        const uint32_t hx = (alloc_w == guest_w) ? x : std::min(uint32_t(scale.Coord(int32_t(x))), alloc_w - 1u);
+        const uint32_t hy = (alloc_h == guest_h) ? gy : std::min(uint32_t(scale.Coord(int32_t(gy))), alloc_h - 1u);
+        uint16_t raw[4], packed[4];
+        std::memcpy(raw, slice_base + size_t(hy) * row_pitch + size_t(hx) * 8, 8);
+        for (int c = 0; c < 4; ++c)
+          packed[c] = raw[src_for_slot[c]];
+        std::memcpy(out + size_t(x) * 8, packed, 8);
+      }
+      return;
+    }
+    for (uint32_t x = 0; x < guest_w; ++x) {
+      uint8_t rgba[4];
+      if (host_format == F::R16G16B16A16_UNORM)
+        ReadHostRgba16UnormTo8(slice_base, row_pitch, alloc_w, alloc_h, x, gy, guest_w, guest_h, scale, rgba);
+      else
+        ReadHostRgba8(slice_base, row_pitch, host_format, alloc_w, alloc_h, x, gy, guest_w, guest_h, scale, rgba);
+      const uint8_t c0 = rgba[src_for_slot[0]];
+      const uint8_t c1 = rgba[src_for_slot[1]];
+      const uint8_t c2 = rgba[src_for_slot[2]];
+      const uint8_t c3 = rgba[src_for_slot[3]];
+      switch (guest_format) {
+      case T::Fmt8:
+      case T::Fmt8_A:
+      case T::Fmt8_B:
+        out[x] = c0;
+        break;
+      case T::Fmt8_8:
+        out[size_t(x) * 2 + 0] = c0;
+        out[size_t(x) * 2 + 1] = c1;
+        break;
+      case T::Fmt5_6_5: {
+        const uint16_t v =
+            uint16_t(PackUnormBits(c0, 5) | (PackUnormBits(c1, 6) << 5) | (PackUnormBits(c2, 5) << 11));
+        std::memcpy(out + size_t(x) * 2, &v, 2);
+        break;
+      }
+      case T::Fmt1_5_5_5: {
+        const uint16_t v = uint16_t(PackUnormBits(c0, 5) | (PackUnormBits(c1, 5) << 5) |
+                                    (PackUnormBits(c2, 5) << 10) | (c3 >= 128 ? 0x8000u : 0u));
+        std::memcpy(out + size_t(x) * 2, &v, 2);
+        break;
+      }
+      case T::Fmt4_4_4_4: {
+        const uint16_t v = uint16_t(PackUnormBits(c0, 4) | (PackUnormBits(c1, 4) << 4) |
+                                    (PackUnormBits(c2, 4) << 8) | (PackUnormBits(c3, 4) << 12));
+        std::memcpy(out + size_t(x) * 2, &v, 2);
+        break;
+      }
+      default:  // Fmt8_8_8_8*
+        out[size_t(x) * 4 + 0] = c0;
+        out[size_t(x) * 4 + 1] = c1;
+        out[size_t(x) * 4 + 2] = c2;
+        out[size_t(x) * 4 + 3] = c3;
+        break;
+      }
+    }
+    return;
+  }
+
+  // Same-size 16-bit/float formats (2, 4 or 8 bytes per texel).
+  const uint32_t hy = (alloc_h == guest_h) ? gy : std::min(uint32_t(scale.Coord(int32_t(gy))), alloc_h - 1u);
+  const uint32_t host_bpp = plume::RenderFormatSize(host_format);
+  const uint32_t channels =
+      host_bpp == 8 && (host_format == F::R16G16B16A16_FLOAT || host_format == F::R16G16B16A16_SNORM) ? 4u : 0u;
+  for (uint32_t x = 0; x < guest_w; ++x) {
+    const uint32_t hx = (alloc_w == guest_w) ? x : std::min(uint32_t(scale.Coord(int32_t(x))), alloc_w - 1u);
+    const uint8_t *p = slice_base + size_t(hy) * row_pitch + size_t(hx) * host_bpp;
+    if (channels == 4) {
+      uint16_t raw[4], packed[4];
+      std::memcpy(raw, p, 8);
+      for (int c = 0; c < 4; ++c)
+        packed[c] = raw[src_for_slot[c]];
+      std::memcpy(out + size_t(x) * 8, packed, 8);
+    } else {
+      std::memcpy(out + size_t(x) * host_bpp, p, host_bpp);
+    }
+  }
+}
+
+void WriteGuestTextureRow(const TextureFetch &fetch, const TextureLevelLayout &layout, uint8_t *dst_base, uint32_t sy,
+                          uint32_t sz, uint32_t guest_w, uint32_t gbpb, uint8_t *row_bytes) {
+  SwapEndian(fetch.Endian(), row_bytes, row_bytes, size_t(guest_w) * gbpb);
+  const uint32_t pitch_blocks = layout.pitch_texels;
+  const uint32_t height_blocks = layout.height;
+  const bool is_3d = fetch.Dimension() == TextureDimension::Tex3D;
+  if (fetch.Tiled()) {
+    const uint32_t bpb_log2 = uint32_t(std::countr_zero(gbpb));
+    const uint32_t run = is_3d ? 1 : TiledRunBlocks(bpb_log2);
+    for (uint32_t x = 0; x < guest_w;) {
+      const uint32_t sx = x + layout.tail_x_blocks;
+      const uint32_t offset = is_3d ? TiledOffset3D(sx, sy, sz, pitch_blocks, height_blocks, bpb_log2)
+                                    : TiledOffset2D(sx, sy, pitch_blocks, bpb_log2);
+      const uint32_t count = std::min(run - sx % run, guest_w - x);
+      std::memcpy(dst_base + offset, row_bytes + size_t(x) * gbpb, size_t(count) * gbpb);
+      x += count;
+    }
+  } else {
+    const size_t offset =
+        (size_t(sz) * height_blocks + sy) * pitch_blocks * gbpb + size_t(layout.tail_x_blocks) * gbpb;
+    std::memcpy(dst_base + offset, row_bytes, size_t(guest_w) * gbpb);
+  }
+}
+
+} // namespace
+
+bool ReadbackResolvedTextureLocked(u32 texture_va, const TextureFetch &fetch) {
+  HostTexture *t = FindHostTextureLocked(texture_va);
+  if (!t || !t->gpu_written || !t->texture)
+    t = FindResolveAliasLocked(texture_va, fetch);
+  if (!t || !t->gpu_written || !t->texture || t->words)
+    return false;
+
+  const uint32_t max_levels = std::min<uint32_t>(t->mip_levels, 32u);
+  const uint32_t max_slices = (t->dimension == TextureDimension::Tex3D && !t->stacked) ? 1u : t->depth;
+  bool any_dirty = false;
+  for (uint32_t slice = 0; slice < std::min<uint32_t>(uint32_t(t->readback_dirty.size()), max_slices); ++slice) {
+    if (t->readback_dirty[slice] != 0) {
+      any_dirty = true;
+      break;
+    }
+  }
+  if (!any_dirty)
+    return true;
+
+  const GpuTextureFormat guest_format = fetch.Format();
+  if (!SupportsReadbackFormats(t->host_format, guest_format)) {
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+      RGPU_WARN("[fnc readback] unsupported format pair: texture {:08X} host {} -> guest {} ({}x{})",
+                texture_va, uint32_t(t->host_format), uint32_t(guest_format), t->width, t->height);
+    }
+    return false;
+  }
+  const uint32_t gbpb = FormatBitsPerPixel(guest_format) >> 3;
+  if (!gbpb || (gbpb & (gbpb - 1u)) != 0)
+    return false;
+
+  auto &s = State();
+  if (!Video::EnsureCommandListLocked())
+    return false;
+  SyncBound(s);
+  g_bound.framebuffer = nullptr;
+  if (t->colour_from || t->colour_current)
+    ColourMaterialiseLocked(*t);
+  if (!t->texture)
+    return false;
+
+  struct DirtySub {
+    uint32_t slice = 0;
+    uint32_t level = 0;
+    uint32_t alloc_w = 0;
+    uint32_t alloc_h = 0;
+    uint32_t alloc_d = 1;
+    uint32_t row_pitch = 0;
+    uint32_t row_texels = 0;
+    uint64_t offset = 0;
+    TextureLevelLayout layout;
+  };
+  const uint32_t host_bpp = plume::RenderFormatSize(t->host_format);
+  if (!host_bpp)
+    return false;
+
+  std::vector<DirtySub> entries;
+  uint64_t total_bytes = 0;
+  for (uint32_t slice = 0; slice < std::min<uint32_t>(uint32_t(t->readback_dirty.size()), max_slices); ++slice) {
+    const uint32_t mask = t->readback_dirty[slice];
+    for (uint32_t level = 0; level < max_levels; ++level) {
+      if (((mask >> level) & 1u) == 0)
+        continue;
+      const TextureLevelLayout layout = GetTextureLevelLayout(fetch, level);
+      if (!layout.page)
+        continue;
+      DirtySub e;
+      e.slice = slice;
+      e.level = level;
+      e.alloc_w = std::max(1u, t->alloc_width >> level);
+      e.alloc_h = std::max(1u, t->alloc_height >> level);
+      e.alloc_d = (t->dimension == TextureDimension::Tex3D && !t->stacked) ? std::max(1u, t->depth >> level) : 1u;
+      e.row_pitch = (e.alloc_w * host_bpp + 255u) & ~255u;
+      e.row_texels = e.row_pitch / host_bpp;
+      e.offset = (total_bytes + 511ull) & ~511ull;
+      e.layout = layout;
+      total_bytes = e.offset + uint64_t(e.row_pitch) * e.alloc_h * e.alloc_d;
+      entries.push_back(e);
+    }
+  }
+  if (entries.empty()) {
+    t->readback_dirty.clear();
+    return true;
+  }
+
+  static const uint32_t kProfileLabel = gpu_profile::Label("texture readback");
+  gpu_profile::Mark(s, kProfileLabel);
+
+  std::unique_ptr<plume::RenderBuffer> readback =
+      s.device->createBuffer(plume::RenderBufferDesc::ReadbackBuffer(total_bytes));
+  if (!readback)
+    return false;
+
+  plume::RenderCommandList *cmd = s.command_list;
+  TransitionTextureLocked(t, plume::RenderTextureLayout::COPY_SOURCE);
+  for (const DirtySub &e : entries) {
+    const plume::RenderBox box(0, 0, int32_t(e.alloc_w), int32_t(e.alloc_h), 0, int32_t(e.alloc_d));
+    cmd->copyTextureRegion(
+        plume::RenderTextureCopyLocation::PlacedFootprint(
+            readback.get(), t->host_format, e.alloc_w, e.alloc_h, e.alloc_d, e.row_texels, e.offset),
+        plume::RenderTextureCopyLocation::Subresource(t->texture.get(), e.level, e.slice), 0, 0, 0, &box);
+  }
+  TransitionTextureLocked(t, plume::RenderTextureLayout::SHADER_READ);
+
+  detail::SubmitAndWaitLocked(s);
+  const auto *mapped = static_cast<const uint8_t *>(readback->map());
+  if (!mapped) {
+    Video::RetireLocked(std::move(readback));
+    return false;
+  }
+
+  uint8_t src_for_slot[4];
+  InverseSwizzleSlots(fetch.Swizzle(), src_for_slot);
+  std::vector<uint8_t> row;
+  u8 *const cards = StoreCards();
+
+  for (const DirtySub &e : entries) {
+    const uint32_t guest_w = std::max(1u, t->width >> e.level);
+    const uint32_t guest_h = std::max(1u, t->height >> e.level);
+    const uint32_t guest_d =
+        (fetch.Dimension() == TextureDimension::Tex3D) ? std::max(1u, t->depth >> e.level) : 1u;
+    const u32 phys_addr = (e.layout.page << 12) + e.layout.offset + e.slice * e.layout.slice_bytes;
+    auto *const dst_base = GuestPhysicalPtr<uint8_t>(phys_addr);
+    if (!dst_base)
+      continue;
+    row.resize(size_t(guest_w) * gbpb);
+    const size_t host_slice_bytes = size_t(e.row_pitch) * e.alloc_h;
+    for (uint32_t z = 0; z < guest_d; ++z) {
+      const uint32_t hz = (e.alloc_d == guest_d) ? z : std::min(z, e.alloc_d - 1u);
+      const uint8_t *slice_src = mapped + e.offset + size_t(hz) * host_slice_bytes;
+      const uint32_t sz = z + e.layout.tail_z;
+      for (uint32_t y = 0; y < guest_h; ++y) {
+        PackGuestReadbackRow(slice_src, e.row_pitch, t->host_format, guest_format, src_for_slot, e.alloc_w,
+                             e.alloc_h, y, guest_w, guest_h, t->scale, row.data());
+        WriteGuestTextureRow(fetch, e.layout, dst_base, y + e.layout.tail_y_blocks, sz, guest_w, gbpb, row.data());
+      }
+    }
+    if (cards) {
+      const u32 mark_bytes = std::max(
+          e.layout.slice_bytes, ((e.layout.pitch_texels * FormatBitsPerPixel(guest_format)) >> 3) *
+                                    e.layout.height * guest_d);
+      rex::memory::MarkStoreCardsAt(cards, 0xA0000000u + (phys_addr & 0x1FFFFFFFu), mark_bytes);
+    }
+  }
+
+  readback->unmap();
+  Video::RetireLocked(std::move(readback));
+  ++g_flush_serial;
+  t->readback_dirty.clear();
+
+  static std::atomic<uint32_t> logged{0};
+  if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+    RGPU_INFO("[fnc readback] texture {:08X} ({}x{} fmt {} host {} endian {} tiled {} swizzle {:03X} packed {} "
+              "mips {}): read back {} subresource(s)",
+              texture_va, t->width, t->height, uint32_t(guest_format), uint32_t(t->host_format), fetch.Endian(),
+              fetch.Tiled() ? 1 : 0, fetch.Swizzle(), fetch.PackedMips() ? 1 : 0, t->mip_levels, entries.size());
+  }
+  return true;
 }
 
 bool FrontBufferWrittenLocked(u32 texture_va) {

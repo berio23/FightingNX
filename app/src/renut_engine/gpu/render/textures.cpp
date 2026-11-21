@@ -410,6 +410,7 @@ std::vector<PendingFill> g_pending_fills;
 bool Upload(HostTexture &t, const TextureFetch &fetch, bool defer_read) {
   FlushResolveMipsLocked(t);  // sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips): from the level 0 the resolves left
   ColourHandOverForgetLocked(t);  // sa2-nx (2026-10-28, sa2_renut_colour_handover): its content is the upload's now
+  t.readback_dirty.clear();
   // banjo-nx (2026-10-19, render-thread proposal 1): the interval the guest bytes are read in: now, or at the next
   // kick's flush (FlushTextureFillsLocked, right after FlushVertexFillsLocked starts a new interval; a later one is
   // only more cautious).
@@ -534,7 +535,6 @@ bool Create(HostTexture &t, const TextureFetch &fetch, bool render_target,
   // No more levels than the size has (GetMaxMipLevels, 0x826554B8).
   const u32 largest = std::max({width, height, fetch.Dimension() == TextureDimension::Tex3D ? depth : 1u});
   const u32 size_levels = 32 - u32(std::countl_zero(largest));
-  t.mip_levels = render_target ? 1 : std::min(fetch.MaxMipLevel() + 1, size_levels);
   t.render_target = render_target;
   plume::RenderFormat format = render_target ? rt_format : t.info.host;
   if (format == plume::RenderFormat::UNKNOWN)
@@ -546,13 +546,24 @@ bool Create(HostTexture &t, const TextureFetch &fetch, bool render_target,
   const uint32_t bs = render_target ? 1 : t.info.block_size;
   const uint32_t w = scale.Size((t.width + bs - 1) / bs * bs);
   const uint32_t h = scale.Size((t.height + bs - 1) / bs * bs);
+  const uint32_t host_levels_max = 32 - uint32_t(std::countl_zero(std::max(w, h)));
   t.extra_levels = 0;
-  if (render_target && host_levels && t.dimension == TextureDimension::Tex2D &&
-      State().texture_mip_ps) {
-    // No more than the host size has.
-    const uint32_t host_levels_max = 32 - uint32_t(std::countl_zero(std::max(w, h)));
-    t.extra_levels = std::min(ExtraLevels(scale), host_levels_max - 1);
-    t.mip_levels += t.extra_levels;
+  if (!render_target) {
+    t.mip_levels = std::min(fetch.MaxMipLevel() + 1, size_levels);
+  } else {
+    // fnc-nx (2026-11-21): colour resolve targets with guest mip levels (TextureCompositor mip generation via
+    // texturemip.fx resolving into dest_level 1..N) keep all guest levels rather than colliding on level 0.
+    const u32 guest_levels = host_levels ? std::min(fetch.MaxMipLevel() + 1, size_levels) : 1u;
+    if (guest_levels > 1) {
+      t.mip_levels = std::min(guest_levels, host_levels_max);
+    } else {
+      t.mip_levels = 1;
+      if (host_levels && t.dimension == TextureDimension::Tex2D && State().texture_mip_ps) {
+        // No more than the host size has.
+        t.extra_levels = std::min(ExtraLevels(scale), host_levels_max - 1);
+        t.mip_levels += t.extra_levels;
+      }
+    }
   }
   t.stacked = fetch.Dimension() == TextureDimension::Tex2D && fetch.Stacked();
   switch (t.dimension) {
@@ -625,6 +636,7 @@ void Retire(HostTexture &t) {
   DepthHandOverForgetLocked(t);  // banjo-nx (2026-10-19, banjo_deko3d_depth_handover)
   ColourHandOverForgetLocked(t);  // sa2-nx (2026-10-28, sa2_renut_colour_handover)
   t.mips_pending = false;  // sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips): nothing reads them now
+  t.readback_dirty.clear();
   if (t.slot != UINT32_MAX && t.slot != kInvalidDescriptor)
     Video::FreeTextureSlotLocked(t.slot);
   t.slot = UINT32_MAX;
@@ -1054,6 +1066,82 @@ HostTexture *FindHostTextureLocked(u32 texture_va) {
   return it != g_textures.end() ? it->second.get() : nullptr;
 }
 
+HostTexture *FindResolveAliasLocked(u32 texture_va, const TextureFetch &fetch) {
+  u32 desc[6];
+  MaskedDesc(fetch, desc);
+  return ResolvedAlias(texture_va, fetch, desc);
+}
+
+namespace {
+std::mutex g_readback_pending_mutex;
+std::atomic<uint32_t> g_readback_pending_count{0};
+std::unordered_map<u32, uint64_t> g_readback_pending_va;
+std::unordered_map<u32, uint64_t> g_readback_pending_page;
+uint64_t g_readback_seq = 0;
+
+void SyncPendingReadbackCountLocked() {
+  g_readback_pending_count.store(uint32_t(g_readback_pending_va.size() + g_readback_pending_page.size()),
+                                 std::memory_order_release);
+}
+} // namespace
+
+void NoteResolvePendingReadback(u32 texture_va, const d3d::TextureFetchConstant *header_format) {
+  if (!texture_va)
+    return;
+  u32 base_page = 0;
+  if (header_format) {
+    const TextureFetch fetch = TextureFetch::FromHeader(*header_format);
+    if (fetch.IsTexture())
+      base_page = fetch.BasePage();
+  }
+  std::lock_guard lock(g_readback_pending_mutex);
+  const uint64_t seq = ++g_readback_seq;
+  g_readback_pending_va[texture_va] = seq;
+  if (base_page)
+    g_readback_pending_page[base_page] = seq;
+  SyncPendingReadbackCountLocked();
+}
+
+void EnsureResolvePendingReadback(u32 texture_va, u32 base_page) {
+  if (!texture_va && !base_page)
+    return;
+  std::lock_guard lock(g_readback_pending_mutex);
+  const uint64_t seq = g_readback_seq ? g_readback_seq : 1;
+  if (texture_va)
+    g_readback_pending_va.try_emplace(texture_va, seq);
+  if (base_page)
+    g_readback_pending_page.try_emplace(base_page, seq);
+  SyncPendingReadbackCountLocked();
+}
+
+bool HasPendingReadback(u32 texture_va, u32 base_page) {
+  if (g_readback_pending_count.load(std::memory_order_acquire) == 0)
+    return false;
+  std::lock_guard lock(g_readback_pending_mutex);
+  return g_readback_pending_va.count(texture_va) != 0 ||
+         (base_page != 0 && g_readback_pending_page.count(base_page) != 0);
+}
+
+uint64_t CurrentPendingReadbackSeq() {
+  std::lock_guard lock(g_readback_pending_mutex);
+  return g_readback_seq;
+}
+
+void ClearPendingReadback(u32 texture_va, u32 base_page, uint64_t up_to_seq) {
+  std::lock_guard lock(g_readback_pending_mutex);
+  if (auto it = g_readback_pending_va.find(texture_va);
+      it != g_readback_pending_va.end() && it->second <= up_to_seq) {
+    g_readback_pending_va.erase(it);
+  }
+  if (base_page) {
+    if (auto it = g_readback_pending_page.find(base_page);
+        it != g_readback_pending_page.end() && it->second <= up_to_seq) {
+      g_readback_pending_page.erase(it);
+    }
+  }
+  SyncPendingReadbackCountLocked();
+}
+
 void ReleaseHostTextureLocked(u32 texture_va) {
   auto it = g_textures.find(texture_va);
   if (it == g_textures.end())
@@ -1272,7 +1360,7 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
   if (banjo::renut_gpu::ResolveTraceOn() && t.gpu_written && t.trace_frame != g_frame) {
     t.trace_frame = g_frame;  // banjo-nx (package 28): banjo_renut_diag_resolve_trace
     RGPU_INFO("[trace] sample resolved {:08X} ({}x{} levels {} fmt {})", texture_va, t.width, t.height,
-              t.extra_levels ? 1 + t.extra_levels : 1, u32(t.host_format));
+              t.mip_levels, u32(t.host_format));
   }
   // One that could not be made is not marked used: it goes once idle, and the
   // next bind tries again (the bindless table may have room by then).

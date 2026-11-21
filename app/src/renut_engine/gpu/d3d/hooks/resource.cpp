@@ -40,6 +40,9 @@
 #include "renut_engine/gpu/guest/resources.h"
 #include "renut_engine/gpu/render/surfaces.h"
 #include "renut_engine/gpu/render/textures.h"
+#include "renut_engine/gpu/backend/queued.h"
+#include "renut_engine/gpu/render/draw.h"
+#include "renut_engine/gpu/render/texture_layout.h"
 #include "renut_engine/gpu/backend/video.h"
 
 using namespace renut::gpu;
@@ -1719,5 +1722,33 @@ BANJO_RENUT_HOOK_RAW(sub_82CDE0F8) {
     ReleaseGuestDeclarationLocked(resource);
   });
   __imp__sub_82CDE0F8(ctx, base);
+}
+
+// fnc-nx (2026-11-21): D3D's central subresource lock (called by LockRect/LockBox/LockTail/D3DSurface_LockRect).
+// FNC's TextureCompositor resolves fighter gear textures on the GPU, then locks the texture on the CPU to copy or
+// DXT-compress it. Without a lazy readback here, guest RAM stays zeros and shorts/gloves compress as black.
+BANJO_RENUT_HOOK_RAW(sub_82CD95F8) {
+  const u32 texture_va = ctx.r3.u32;
+  __imp__sub_82CD95F8(ctx, base);
+  auto &s = State();
+  if (!texture_va || !s.host_ready || s.shutting_down.load(std::memory_order_acquire))
+    return;
+  const auto *header = GuestPtr<const d3d::BaseTexture>(texture_va);
+  if (!header)
+    return;
+  const TextureFetch fetch = TextureFetch::FromHeader(header->Format);
+  if (!fetch.IsTexture())
+    return;
+  const u32 base_page = fetch.BasePage();
+  if (!HasPendingReadback(texture_va, base_page))
+    return;
+  if (const u32 dev = Video::GuestDevice())
+    FlushDeferredVertices(dev);
+  const uint64_t seq = CurrentPendingReadbackSeq();
+  render_thread::Queue([texture_va, fetch, base_page, seq] {
+    ReadbackResolvedTextureLocked(texture_va, fetch);
+    ClearPendingReadback(texture_va, base_page, seq);
+  });
+  render_thread::Drain();
 }
 #endif  // RENUT_GAME_FNC

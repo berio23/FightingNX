@@ -26,6 +26,7 @@
 #include "renut_engine/gpu/guest/guest_memory.h"
 #include "renut_engine/gpu/log.h"
 #include "renut_engine/gpu/backend/render_thread.h"
+#include "renut_engine/gpu/render/textures.h"
 #include "renut_engine/gpu/banjo_renut_tuning.h"
 #include "renut_engine/gpu/sa2_line_compare.h"
 #include "renut_engine/gpu/sa2_setter_marks.h"
@@ -1076,6 +1077,8 @@ void QueueResolve(u32 device_va, u32 flags, const ClearRect *source_rect, u32 de
   args->has_dest_format = header != nullptr;
   if (header)
     args->dest_format = header->Format;
+  if ((flags & 7) != 4 && dest_texture_va)
+    NoteResolvePendingReadback(dest_texture_va, header ? &header->Format : nullptr);
   args->flags = flags;
   args->dest_texture_va = dest_texture_va;
   args->dest_x = dest_x;

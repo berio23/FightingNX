@@ -217,3 +217,74 @@ fights.
 - The fighters' colour pass (vertex shader A8AA59AFFAB9C9F0) samples 9 textures; slot 1 (texture BD247D80, fetch
   base EEE3B054, 1024 wide) is all zeros at the CPU's address too: its contents are not in memory. Next: who fills it
   (a GPU resolve or render target, or a CPU copy from another address).
+
+## PC bench: Switch shortcut config + custom gear textures fixed (2026-11-21)
+
+1. **Switch SD shortcuts re-enabled (`E:\switch\fnc-nx\fnc-nx.toml` and `out\nx\sdcard\switch\fnc-nx\fnc-nx.toml`):**
+   deleted the 7 shortcut overrides (`sa2_renut_colour_handover`, `sa2_renut_lazy_resolve_mips`,
+   `sa2_renut_direct_resolve_mips`, `sa2_renut_clear_repeat`, `banjo_deko3d_depth_handover`,
+   `banjo_deko3d_draw_resolves`, `banjo_renut_resolve_skip`), keeping `sa2_renut_setter_marks = false` and
+   `sa2_renut_setter_marks_check = false`. Ready for console testing (not yet tested on Switch).
+2. **Issue 1 root cause (fighters' shorts transparent / gloves black):**
+   the earlier lead (`player_body_damage_gp` / `A8AA59AFFAB9C9F0` / `BD247D80` at `EEE3B054`) was the body/skin/damage
+   pass; the shorts and gloves are `player_shorts_coarsecotton` (`vs 747EC94F3B1B2E90`, `ps 2F29D47F180948C0`) and
+   `player_glove_leather` (`vs 1C131265EAD45A5E`, `ps 71486B610EEC293D`). FNC's `TextureCompositor` (`sub_827E50C0`)
+   draws gear layers into EDRAM, resolves level 0 (`sub_827D3450`) and generates mips `1..N` via `texturemip.fx`
+   (`sub_827D5510`) into `dest_level = 1..N`, then locks the resolved texture on the CPU (`sub_82CD95F8`, the central
+   subresource lock) to copy (`sub_827CC358`) or tile-to-linear + DXT-compress (`sub_827DC238`) into the gear textures.
+   Renut previously ignored `dest_level > 0` on colour resolve targets (allocating 1 guest level and overwriting
+   level 0) and never read GPU resolves back to guest RAM on CPU lock, so `DxtCompression` compressed zeros.
+3. **Fix:**
+   - `app/src/renut_engine/gpu/render/textures.h`, `textures.cpp`: allocate guest mip levels up to
+     `min(fetch.MaxMipLevel() + 1, size_levels)` (capped to `host_levels_max`, `extra_levels = 0` when
+     `guest_levels > 1`) on colour resolve targets; track `HostTexture::readback_dirty` and resolve-readback
+     aliases (`FindResolveAliasLocked`, `NoteResolvePendingReadback`, `EnsureResolvePendingReadback`,
+     `HasPendingReadback`, `CurrentPendingReadbackSeq`, `ClearPendingReadback`).
+   - `app/src/renut_engine/gpu/render/draw.h`, `draw.cpp`: pass `level` into `CopyColourResolveLocked` and
+     `ColourHandOverResolveLocked`, clamp resolve rects to `dest_level` host dimensions, stage MSAA resolves for
+     `dest_level > 0 || slice > 0 || z > 0`, mark `readback_dirty[slice] |= (1u << dest_level)`, and add
+     `ReadbackResolvedTextureLocked` (batched `ReadbackBuffer` copy + `SubmitAndWaitLocked` + channel
+     unswizzle/scale-average/endian-swap/retile to guest RAM + `rex::memory::MarkStoreCardsAt` + `++g_flush_serial`).
+   - `app/src/renut_engine/gpu/backend/queued.cpp`: call `NoteResolvePendingReadback` on colour resolves in
+     `QueueResolve`.
+   - `app/src/renut_engine/gpu/d3d/hooks/resource.cpp`: add `BANJO_RENUT_HOOK_RAW(sub_82CD95F8)` to flush deferred
+     vertices, run `ReadbackResolvedTextureLocked`, clear pending readback, and `render_thread::Drain()` when
+     `HasPendingReadback` is true; regenerated direct calls (`python tools/direct_calls.py --redo`, 161717 calls in 3
+     files, 1392 hooked addresses respected, 3 hooked callers, 0 `__imp__sub_82CD95F8(`).
+4. **PC verification (`out\pc-renut\sa2.exe`, `--sa2_renderer=renut --resolution_scale=1 --fnc_frame_rate=30`):**
+   - 16 `[fnc readback]` hits in `out\pc-renut\logs\fnc-nx_065.log` (`fmt 6 host 20 endian 2 tiled 1 swizzle 60A`,
+     `128x128` mips `1` through `1024x1024` mips `4`), 0 `out of range`, 0 `unsupported format`, 0 `flash`,
+     0 `Device lost`, `plume_stderr.log` size `0`.
+   - Compared 300 captured frames (`video_105s.rgba`) against `C:\Games\fnc-ref-recorder\build\captures\video_105s.rgba`:
+     overall MAD `27.10` (before, `owned2_105s.rgba`) -> `15.10` (`video_105s.rgba`); active frames (272, +-15 aligned)
+     `25.40` -> `11.98`. Walkaway `ref[2]` shorts+wraps crop `(170, 170, 245, 250)` MAD `41.46` (`gear.rgba[76]`) ->
+     `29.95` (`video_105s.rgba[1]`, mean luma `100.4` -> `113.9` vs ref `138.2`); walkaway end `ref[14]` full MAD
+     `6.66` (`12.57` crop) -> `0.10` (`0.00` crop); knockdown `aft[238]` vs `ref[239]` shorts+wraps `(250, 140, 370, 280)`
+     MAD `13.19` (mean luma `66.4` vs ref `68.8`), `aft[255]` vs `ref[256]` full MAD `1.93` (crop `1.47`). Visual
+     inspection confirms white/grey patterned shorts with waistband stripe and white taped hand wraps match the
+     reference (both were previously black).
+   - **Not yet verified:** Switch NRO rebuild and console run with this fix (or the SD-card shortcut change), PC
+     `--resolution_scale > 1`, and coloured gloves in non-prison arenas. Shadows and crowd remain open.
+
+## Fourth & fifth console runs (2026-11-21): shorts and gloves fixed on Switch
+
+1. **Run 4** (`out/console_runs/run4/fnc-nx_006.log`, commit `136a4bc` + 7 renderer shortcuts re-enabled,
+   `sa2_renut_setter_marks* = false` kept):
+   - **Gloves fixed on hardware:** `16` `[fnc readback]` info hits during fighter load (matching the 16-log cap), `114`
+     total deko3d copy readbacks, `0` readback errors, and `0` per-frame fight readbacks.
+   - **Shorts still missing/transparent in Run 4** because `224` fight shaders (`shader_capture/*.bin`, `0` overlap
+     with the `879` boot/title/intro cache) were not yet in the local Switch shader package (`player_shorts_finecotton*`,
+     `player_shorts_satin_gp`, `player_satin*`, `crowd_instancingshader`, `farcrowd_instancingshader`, hair, mouthguards,
+     ring girls).
+   - **Performance with the 7 shortcuts back on:** fight GPU time dropped from `25.7-31.5 ms` (run 3) to `22.7-26.2 ms`,
+     while fight FPS stayed `12.9-17.2 FPS` (`game thread` `50.3-69.2 ms`, `render thread` `25.0-26.8 ms`) because the
+     Switch is CPU-bound across 6 guest threads + render thread on 3 cores. Top `rex_profile.log` hotspots:
+     `FGGameSim` (`sub_8283AEA0` 65.9% incl., `sub_82C60688` 17.1%), `Job Thread 0/2/3` (`sub_826D8178` 11.8-12.6%,
+     `sub_8283B828` 7.7-9.9%), `Job Thread 4` (`sub_82A8F798` 15.5%, `sub_82A8B590` 8.7%, XMA `decode_frame` 7.9%),
+     `FGGameRender` (`CaptureDelta` 6.6%, `sub_82CE5670` 65.7% incl.), render thread (`XXH3_hashLong_64b_withSeed` 17.1%,
+     `ExpandElement<2u>` 16.4%, `ConvertVertices` 7.2%).
+2. **Run 5** (after rebuilding the local Switch shader package with all `1,103` shaders — `879 + 224` — and passing
+   `tools/check_switch_build.py --classic` on `56,939,015`-byte `fnc-nx.nro`):
+   - **Shorts and gloves both render and look good on Switch** (verified by user on console).
+   - **Remaining on Switch:** fights are playable but still very laggy (CPU-bound); **sporadic black artifacts**
+     sometimes appear on fighters' bodies; **shadows are still black boxes** (still open).

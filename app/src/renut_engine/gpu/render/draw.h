@@ -133,6 +133,7 @@ void ClearStateLocked(const u8 *device_state, u32 flags, const ClearRect *rect,
 // 'dest_format': the destination header's fetch constant when the resolve was
 // issued, or nullptr to read the header now.
 struct HostTexture;
+struct TextureFetch;
 
 // banjo-nx (2026-10-19, banjo_renut_depth_words_lazy): 'dest' (a depth resolve destination) is read through its words:
 // writes them now if its last resolve did not (from the unchanged source), and from now on at every resolve.
@@ -151,6 +152,11 @@ void ResolveStateLocked(const u8 *device_state, u32 flags, const ClearRect *sour
 // clamped to the target. Submits the open command list and waits for the GPU.
 bool ReadRenderTargetLocked(const u8 *device_state, u32 source, u32 &width, u32 &height,
                             std::vector<u32> &words);
+
+// fnc-nx (2026-11-21): reads any GPU-written colour resolve subresources of 'texture_va' (or its resolve alias)
+// back into guest physical memory using the layout, swizzle, tiling and endianness described by 'fetch'. Submits the
+// open command list and waits once for all dirty subresources.
+bool ReadbackResolvedTextureLocked(u32 texture_va, const TextureFetch &fetch);
 
 // What Swap scans out for the guest front buffer texture, or an empty image.
 PresentImage FrontBufferImageLocked(u32 texture_va);

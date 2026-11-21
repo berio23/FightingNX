@@ -21,7 +21,7 @@ Work in progress. Fights are playable on the Switch, with known graphics issues.
 |---|---|---|
 | Boots, menus, video cinematics | yes | yes |
 | Fights render (ring, fighters, crowd, HUD) | yes | yes |
-| Known graphics issues | fighter shadows wrong, some gear textures (shorts, gloves) black, thinner crowd | the same |
+| Known graphics issues | fighter shadows wrong (black boxes), thinner crowd (shorts and gloves fixed) | fighter shadows black boxes, sporadic black artifacts on fighters' bodies, thinner crowd (shorts and gloves fixed) |
 | Frame rate in fights | full speed | 13-20 FPS (CPU-bound; target 30) |
 | Audio | clean | clean in menus, some crackle in fights (CPU load) |
 

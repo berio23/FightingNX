@@ -169,6 +169,9 @@ struct HostTexture {
   uint64_t colour_writes = 0;
   std::shared_ptr<DepthImage> colour_held;
   bool colour_current = false;
+  // fnc-nx (2026-11-21): per-slice bitmask of mip levels written by GPU colour resolves since the last CPU readback
+  // into guest physical memory (bit 'level' set -> subresource (slice, level) dirty).
+  std::vector<uint32_t> readback_dirty;
 };
 
 struct TextureBinding {
@@ -274,6 +277,18 @@ HostTexture *GetDepthResolveTextureLocked(u32 texture_va, RenderScale scale,
 
 // Existing host texture for a guest texture VA, or nullptr.
 HostTexture *FindHostTextureLocked(u32 texture_va);
+
+// fnc-nx (2026-11-21): existing resolve destination over 'fetch''s base page with matching data layout (alias),
+// or nullptr.
+HostTexture *FindResolveAliasLocked(u32 texture_va, const TextureFetch &fetch);
+
+// fnc-nx (2026-11-21): tracks colour resolves so a subsequent CPU lock on the texture (sub_82CD95F8) can read
+// GPU-written pixels back into guest physical memory lazily, without touching CPU-written textures.
+void NoteResolvePendingReadback(u32 texture_va, const d3d::TextureFetchConstant *header_format);
+void EnsureResolvePendingReadback(u32 texture_va, u32 base_page);
+bool HasPendingReadback(u32 texture_va, u32 base_page);
+uint64_t CurrentPendingReadbackSeq();
+void ClearPendingReadback(u32 texture_va, u32 base_page, uint64_t up_to_seq);
 
 void ReleaseHostTextureLocked(u32 texture_va);
 
