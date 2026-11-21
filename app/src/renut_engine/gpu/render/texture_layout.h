@@ -99,7 +99,12 @@ struct TextureFetch {
   GpuTextureFormat Format() const { return GpuTextureFormat(dword[1] & 0x3F); }
   u32 Endian() const { return (dword[1] >> 6) & 3; }
   bool Stacked() const { return (dword[1] >> 10) & 1; }
-  u32 BasePage() const { return dword[1] >> 12; }
+  // fnc-nx (2026-11-21): a fetch constant can hold a CPU address in the 0xE0000000 region (4 KB pages), whose
+  // physical memory starts 4 KB further on (D3D's GPU_CONVERT_CPU_TO_GPU_ADDRESS, the SDK's views: xmemory.cpp
+  // map_info). Fight Night Champion's crowd animation texture does (E5F17060): Renut read it 4 KB early and the crowd
+  // drew as giant shards. Every other page is used as it is (physical addresses, as N&B's and SA2's are).
+  static constexpr u32 GpuPage(u32 page) { return page >= 0xE0000u ? (page & 0x1FFFFu) + 1u : page; }
+  u32 BasePage() const { return GpuPage(dword[1] >> 12); }
 
   u32 Swizzle() const { return (dword[3] >> 1) & 0xFFF; }
   TextureFilter MagFilter() const { return TextureFilter((dword[3] >> 19) & 3); }
@@ -118,7 +123,7 @@ struct TextureFetch {
   u32 BorderColor() const { return dword[5] & 3; }  // 0 transparent black, 1 white
   TextureDimension Dimension() const { return TextureDimension((dword[5] >> 9) & 3); }
   bool PackedMips() const { return (dword[5] >> 11) & 1; }
-  u32 MipPage() const { return dword[5] >> 12; }
+  u32 MipPage() const { return (dword[5] >> 12) ? GpuPage(dword[5] >> 12) : 0u; }
 
   // Width, height and depth including the border (GetGpuTextureDimensions);
   // depth is the slice count of 2D arrays and cube maps.

@@ -165,3 +165,55 @@ The Switch NRO staged in out/nx/sdcard/switch/fnc-nx has fix 1 (built 2026-11-21
 Next (needs new diagnostics): the two pairs' SurfaceInfo / ColorInfo at the fight; a dump of the fight's host targets
 after the depth pre-pass and after the colour draws; then the first wrong draw, its vertex streams and declaration,
 against the reference.
+
+## The fights render (2026-11-21, afternoon)
+
+The second console run (all three cores, XMA mode 0) showed the fight green and black with stretched shapes, the HUD
+correct; the menus' audio clean, the fight's crackling. On the PC the same frames came out as shards over black. The
+causes, in the order found, each checked against FNC Reborn's frames (fresh profile, the prison fight):
+
+| Cause | Fix | Commit |
+|---|---|---|
+| The tiled pass's host targets one tile tall (1280x256) | the render thread told of FNC's own BeginTiling / EndTiling | b8ac70a |
+| BeginTiling's clear covered rows 0-255 only | whole-target while FNC's BeginTiling runs; the tiles told before it runs | f9f4d54 |
+| Texture and vertex fetch addresses in the 0xE0000000 region read 4 KB early | `TextureFetch::GpuPage`, the same + 0x1000 for vertex fetches (the bytes at the CPU address equal physical + 4 KB) | f9f4d54 |
+| **GPU-owned shader constants**: the engine (sub_8245AD18 / sub_8245AD90) writes them into the command buffer (sub_82CE5AC0) or has the GPU load them (LOAD_ALU_CONSTANT, sub_82CE5B48); the device image Renut reads never had them (the camera c0-c3, the crowd's c40-c195, the pixel constants) | the same data copied into the image | f9f4d54 |
+| The copies set no pending bits, so the snapshot deltas never passed them on (the crowd collapsed) | m_Pending marked; the loads copied again at the next draw | 0cbb31a |
+
+Found on the way: tools/direct_calls.py (optimised flavour) makes calls to functions without a hook direct, so every
+new hook needs `python tools/direct_calls.py --redo` before it is called at all.
+
+PC result: the ring, both fighters, the crowd, the knockdown view; the selection screen unchanged (0.50 median against
+a clean run). On the console: built, not yet run.
+
+Also in that build: the game's mixer thread (RwAudioCore) one priority step above the other guest threads, for the
+fights' crackle (the cores full; every audio buffer delivered). Not yet heard on the console.
+
+### Still open in the fights' graphics (PC, 2026-11-21)
+
+- **The fighters cast no shadow.** FNC Reborn draws a sharp fighter shadow on the canvas; Renut none (default
+  settings), or with the depth shortcuts off (banjo_gpu_depth_only, banjo_gpu_depth_words_view,
+  banjo_renut_depth_words_lazy, banjo_renut_depth_words_stencil, banjo_renut_resolve_skip) a dark diamond: the whole
+  projected area shadowed. Both read as an empty shadow map. Ruled out: the caster draws (the frame's first 8, the
+  fighters' depth-only vertex shader 9F1398D86E8A5F55) and their viewport and scissor (512x512, logged). Next: the
+  shadow map's depth resolve (surface format 33) read back as a texture (format 34), Renut's depth-words path.
+- **The crowd looks thinner** than the reference's (gaps between inmates). Not looked into.
+- Shadow, also ruled out (2026-11-21): the map is sampled as its own resolve destination (texture BD26B840, guest
+  format 23 = 24_8_FLOAT, depth words present), and the words pass encodes the 512x512 surface (format word 1A220197,
+  format 23) as 20e4 float, as the game samples it. Left: what the caster draws write into the host depth target
+  (a dump of it before the resolve), and the shadow comparison in the canvas's pixel shader.
+
+## Third console run (2026-11-21, evening): fights playable
+
+The fight plays on the Switch (a knockdown scored): 13-20 FPS, game thread 43-67 ms, render thread 22-27 ms, GPU
+23-31 ms (the renderer shortcuts still off on the card). The user saw: the fighters' shorts transparent and gloves
+black (custom gear textures), shadows as big grey-black boxes, a thinner crowd; the audio better but crackling in
+fights.
+
+- A 1024x1024 colour target drawn with a 512x512 depth bound (warned 8 times): such a depth is now left out for draws
+  that neither test nor write depth nor use stencil (draw.cpp GatherTargets; past its edge D3D12 is undefined and
+  Maxwell faults). It turned out to be the shadow system's target: the PC now shows the same dark shadow area as the
+  console. Not yet the gear.
+- The fighters' colour pass (vertex shader A8AA59AFFAB9C9F0) samples 9 textures; slot 1 (texture BD247D80, fetch
+  base EEE3B054, 1024 wide) is all zeros at the CPU's address too: its contents are not in memory. Next: who fills it
+  (a GPU resolve or render target, or a CPU copy from another address).

@@ -1027,8 +1027,8 @@ void ReleaseHostTexturesInMemoryLocked(u32 physical, u32 size) {
   for (const auto &[va, t] : g_textures) {
     if (!t)
       continue;
-    const u32 base_page = t->desc[1] >> 12;
-    const u32 mip_page = t->desc[5] >> 12;
+    const u32 base_page = TextureFetch::GpuPage(t->desc[1] >> 12);  // fnc-nx: as BasePage / MipPage
+    const u32 mip_page = (t->desc[5] >> 12) ? TextureFetch::GpuPage(t->desc[5] >> 12) : 0u;
     if (inside(base_page) || (mip_page && inside(mip_page)))
       gone.push_back(va);
   }
@@ -1161,6 +1161,15 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
     resolved->used_frame = g_frame;
     if (resolved->words)
       banjo::renut_gpu::CountDepthFloatSampled();  // banjo-nx (2026-10-18): a depth resolve's float target sampled
+    // fnc-nx (2026-11-21, diagnostic): the game's own fetch format for a resolved depth target it samples (the
+    // fighters' shadow map reads as empty), against the host texture it is given.
+    if (resolved->words || (resolved->width == 512 && resolved->height == 512)) {
+      static std::atomic<uint32_t> logged{0};
+      if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+        RGPU_INFO("[fnc depth sample] texture {:08X}: guest format {} (endian {}, swizzle {:03X}, {}x{}), depth words {}",
+                  texture_va, u32(fetch.Format()), fetch.Endian(), fetch.Swizzle(), resolved->width, resolved->height,
+                  resolved->words != nullptr);
+    }
     ColourHandOverBeforeReadLocked(*resolved);  // sa2-nx (2026-10-28, sa2_renut_colour_handover)
     FlushResolveMipsLocked(*resolved);  // sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips)
     TransitionTextureLocked(resolved, plume::RenderTextureLayout::SHADER_READ);
@@ -1212,6 +1221,14 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
   // What a depth resolve wrote to the memory (only the GPU has it), which is
   // at the resolve's scale; guest data is at the guest size.
   HostTexture *depth_source = !(slot && slot->gpu_written) ? DepthWordsSource(fetch) : nullptr;
+  // fnc-nx (2026-11-21, diagnostic): the 512x512 shadow map is sampled as its own resolve destination (this path, not
+  // ResolvedAlias): the game's fetch format for it, and what Renut holds.
+  if (slot && slot->gpu_written && slot->width == 512 && slot->height == 512) {
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 6)
+      RGPU_INFO("[fnc depth sample] own resolve {:08X}: guest format {} (endian {}, swizzle {:03X}), depth words {}",
+                texture_va, u32(fetch.Format()), fetch.Endian(), fetch.Swizzle(), slot->words != nullptr);
+  }
   if (depth_source) {
     EnsureDepthWordsLocked(*depth_source);  // banjo-nx (banjo_renut_depth_words_lazy)
     if (fx)

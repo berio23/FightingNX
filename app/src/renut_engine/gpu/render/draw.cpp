@@ -64,6 +64,11 @@ REXCVAR_DEFINE_STRING(banjo_renut_diag_stream_dump_vs, "", "Banjo/Renut",
 REXCVAR_DEFINE_INT32(banjo_renut_diag_draw_log_s, 0, "Banjo/Renut",
                      "Diagnostic: this many seconds after the first draw, log every draw of the next two frames "
                      "([drawlog]: shaders, counts, target, state; 0 = off)");
+// fnc-nx (2026-11-21): diagnostics for the fights' broken geometry.
+REXCVAR_DEFINE_BOOL(fnc_diag_skip_vfetch_draws, false, "Banjo/Renut",
+                    "Diagnostic: leave out every draw that fetches vertices by address (vfetch bytes > 0)");
+REXCVAR_DEFINE_STRING(fnc_diag_skip_vs, "", "Banjo/Renut",
+                      "Diagnostic: leave out the draws of these vertex shaders (16-digit hex hashes, any separator)");
 REXCVAR_DEFINE_STRING(banjo_renut_diag_blend_skip_exclude, "", "Banjo/Renut",
                       "Diagnostic: pixel shader hashes (hex, comma separated) banjo_gpu_blend_skip leaves alone");
 
@@ -1182,6 +1187,14 @@ bool GatherTargets(const GuestDevice &device, Targets &t) {
   HostSurface *depth = GetHostSurfaceLocked(device.U32(d3d::kDeviceOffsetDepthStencil));
   if (depth && depth->depth)
     t.depth = depth;
+  // fnc-nx (2026-11-21): a depth target smaller than the colour target, for a draw that neither tests nor writes depth
+  // nor uses stencil (RB_DEPTHCONTROL bits 0-2 clear), is left out. FNC composites its fighters' 1024x1024 texture
+  // sheets (shorts, gloves) with a 512x512 depth surface still bound: on the Xbox 360 the unused depth costs nothing,
+  // on the host past its edge is undefined (D3D12) or a "ZT width violation" (Maxwell), and the sheets came out
+  // black and transparent (the fighters' gloves and shorts on the console).
+  if (t.depth && t.color_count && (t.depth->width < t.colors[0]->width || t.depth->height < t.colors[0]->height) &&
+      !(u32(device.dev().m_ControlPacket.DepthControl) & 0x7u))
+    t.depth = nullptr;
   if (!t.color_count && !t.depth)
     return false;
   const HostSurface *first = t.color_count ? t.colors[0] : t.depth;
@@ -1531,7 +1544,8 @@ ViewportState ComputeViewportSlow(const GuestDevice &device, const Targets &t) {
   vs.scissor = ScaleRect(plume::RenderRect(sx1, sy1, sx2, sy2), t.scale);
   // fnc-nx (2026-11-21, diagnostic): the fights' tiled 4x MSAA pass draws stretched shards; what the viewport is made
   // from while tiling, for the first 40 draws.
-  if (g_tiles.size() >= 2) {
+  // Also the 512x512 shadow map's depth-only draws (the fighters cast no shadow).
+  if (g_tiles.size() >= 2 || t.guest_width == 512 || t.width == 512) {
     static std::atomic<uint32_t> logged{0};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 40) {
       RGPU_INFO("[fnc vp] vte {:02X} mode {:08X} xs {} xo {} ys {} yo {} zs {} zo {} win ({},{}) wsc {:08X}-{:08X} "
@@ -2893,7 +2907,12 @@ UploadAllocation UploadVertexFetchData(const GuestDevice &device, const DrawCall
     } else {
       const u32 w0 = device.VertexFetchWord(index, 0);
       const u32 w1 = device.VertexFetchWord(index, 1);
-      c.src = (w0 & ~3u) ? GuestPhysicalPtr<const u8>(w0 & ~3u) : nullptr;
+      // fnc-nx (2026-11-21): an address in the 0xE0000000 region is a CPU address whose physical memory starts 4 KB
+      // further on (as TextureFetch::GpuPage; FNC's crowd reads its vertices and its animation texture there).
+      u32 address = w0 & ~3u;
+      if (address >= 0xE0000000u)
+        address = (address & 0x1FFFFFFFu) + 0x1000u;
+      c.src = address ? GuestPhysicalPtr<const u8>(address) : nullptr;
       c.size = w1 & 0x3FFFFFCu;
       c.endian = w1 & 3;
     }
@@ -4513,11 +4532,78 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     g_dump_fetch = want && vs->hash == want;
   }
   UploadAllocation fetch_alloc = UploadVertexFetchData(device, call, fetch_mask, sc);
+  if (g_dump_fetch && call.indexed && !call.up_indices) {
+    // fnc-nx (2026-11-21): the fighters' index buffer as the game made it (its Common word decides 16/32 bits and
+    // the byte order), its size against the draw's count, and its first raw bytes.
+    static uint32_t logged_ib = 0;
+    if (logged_ib++ < 6) {
+      const auto *ib = GuestPtr<const d3d::IndexBuffer>(device.U32(d3d::kDeviceOffsetIndexBuffer));
+      if (ib) {
+        const u32 address = u32(ib->Address);
+        const auto *raw = address ? GuestPhysicalPtr<const u8>(address & ~3u) : nullptr;
+        u32 w[4] = {};
+        if (raw)
+          std::memcpy(w, raw, 16);
+        RGPU_INFO("[fetchdump] index buffer {:08X}: Common {:08X} Address {:08X} Size {} (count {}, start index {}); "
+                  "first bytes {:08X} {:08X} {:08X} {:08X}",
+                  device.U32(d3d::kDeviceOffsetIndexBuffer), u32(ib->resource.Common), address, u32(ib->Size),
+                  call.count, call.start_index, w[0], w[1], w[2], w[3]);
+      }
+    }
+  }
+  if (g_dump_fetch && vs->entry) {
+    // fnc-nx (2026-11-21): the textures the vertex shader samples (the crowd's animation texture): each slot's
+    // texture object and its fetch constant words as the game set them.
+    static uint32_t logged_vtex = 0;
+    if (logged_vtex++ < 6) {
+      const u32 vmask = vs->entry->textureFetchMask;
+      const u32 pmask = ps && ps->entry ? ps->entry->textureFetchMask : 0u;
+      RGPU_INFO("[fetchdump] vs textures mask {:08X}, ps mask {:08X}", vmask, pmask);
+      // fnc-nx: the pixel shader's slots too (the fighters' shorts and gloves draw black or transparent).
+      for (u32 r = 0; r < d3d::kTextureFetchSlots; ++r) {
+        if (!((vmask | pmask) & (1u << r)))
+          continue;
+        const u32 va = device.U32(d3d::kDeviceOffsetTextures + r * 4);
+        const auto *header = va ? GuestPtr<const be_u32>(va) : nullptr;
+        if (!header) {
+          RGPU_INFO("[fetchdump]   slot {}: no texture", r);
+          continue;
+        }
+        RGPU_INFO("[fetchdump]   slot {}: texture {:08X} common {:08X} fetch {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                  r, va, u32(header[0]), u32(header[7]), u32(header[8]), u32(header[9]), u32(header[10]),
+                  u32(header[11]), u32(header[12]));
+        // The first 16 bytes where Renut reads (physical: the address's low 29 bits), 4 KB further (the 0xE0000000
+        // region's physical offset), and at the CPU's virtual address, as big-endian 16-bit words.
+        const u32 base = u32(header[8]) & 0xFFFFF000u;
+        const u8 *at[3] = {GuestPhysicalPtr<const u8>(base & 0x1FFFFFFFu),
+                           GuestPhysicalPtr<const u8>((base & 0x1FFFFFFFu) + 0x1000u),
+                           base >= 0x20000000u ? GuestPtr<const u8>(base) : nullptr};
+        const char *names[3] = {"phys", "phys+4K", "virtual"};
+        for (int k = 0; k < 3; ++k) {
+          if (!at[k])
+            continue;
+          u16 h[8];
+          for (int j = 0; j < 8; ++j)
+            h[j] = u16((at[k][2 * j] << 8) | at[k][2 * j + 1]);
+          RGPU_INFO("[fetchdump]     {} {:08X}: {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X}", names[k],
+                    k == 0 ? (base & 0x1FFFFFFFu) : k == 1 ? (base & 0x1FFFFFFFu) + 0x1000u : base, h[0], h[1], h[2],
+                    h[3], h[4], h[5], h[6], h[7]);
+        }
+      }
+    }
+  }
   if (g_dump_fetch) {
     static uint32_t logged = 0;
     if (logged++ < 24)
-      RGPU_INFO("[fetchdump] draw: mask {:08X} fetch data {:X} bytes {} prim {} count {} tess {}", fetch_mask,
-                sc.vertex_fetch_data, sc.vertex_fetch_bytes, call.primitive, call.count, call.tessellation);
+      RGPU_INFO("[fetchdump] draw: mask {:08X} fetch data {:X} bytes {} prim {} count {} tess {}; indexed {} start "
+                "vertex {} base vertex {} start index {} lacks {}; vertices {}+{}; bound [{} {} {} {:X}] [{} {} {} {:X}] "
+                "[{} {} {} {:X}]",
+                fetch_mask, sc.vertex_fetch_data, sc.vertex_fetch_bytes, call.primitive, call.count, call.tessellation,
+                call.indexed, call.start_vertex, call.base_vertex, call.start_index, sc.tessellation[3],
+                geometry.first_vertex, geometry.vertex_range,
+                sc.bound_fetch[0][0], sc.bound_fetch[0][1], sc.bound_fetch[0][2], sc.bound_fetch[0][3],
+                sc.bound_fetch[1][0], sc.bound_fetch[1][1], sc.bound_fetch[1][2], sc.bound_fetch[1][3],
+                sc.bound_fetch[2][0], sc.bound_fetch[2][1], sc.bound_fetch[2][2], sc.bound_fetch[2][3]);
   }
   g_dump_fetch = false;
 #if defined(PLUME_DEKO3D)
@@ -4858,6 +4944,19 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     if (dc & 1)
       targets.depth->stencil_used = true;  // banjo-nx (2026-10-19, banjo_deko3d_depth_handover)
   }
+  // fnc-nx (2026-11-21, diagnostic): leave draws out to find which ones make the fights' shards.
+  {
+    static const bool skip_vfetch = REXCVAR_GET(fnc_diag_skip_vfetch_draws);
+    static const std::string skip_list = REXCVAR_GET(fnc_diag_skip_vs);
+    if (skip_vfetch && sc.vertex_fetch_bytes)
+      return true;
+    if (!skip_list.empty() && vs) {
+      char hex[17];
+      std::snprintf(hex, sizeof(hex), "%016llX", static_cast<unsigned long long>(vs->hash));
+      if (skip_list.find(hex) != std::string::npos)
+        return true;
+    }
+  }
   Video::NoteDrawLocked();  // banjo-nx (2026-10-19, banjo_deko3d_kick_submit): the open list's draws
   if (geometry.indexed) {
     SetIndexBuffer(cmd, geometry.index_view);
@@ -5192,6 +5291,15 @@ bool ResolveDepth(HostSurface *surface, HostTexture *dest, const ClearRect &src,
   push.param0 = GpuTextureFormat(surface->format_word & 0x3F) == GpuTextureFormat::Fmt24_8_Float
                     ? 1.0f
                     : 0.0f;
+  // fnc-nx (2026-11-21, diagnostic): the fighters' shadow map (512x512) is sampled as 24_8_FLOAT; the words' encoding
+  // follows the depth surface's format word.
+  {
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 6)
+      RGPU_INFO("[fnc depth words] surface {}x{} format word {:08X} (format {}): encoded as {}", surface->width,
+                surface->height, surface->format_word, surface->format_word & 0x3F,
+                push.param0 != 0.0f ? "20e4 float" : "24-bit unorm");
+  }
   cmd->setGraphicsPushConstants(0, &push, 0, sizeof(push));
   cmd->drawInstanced(3, 1, 0, 0);
   TransitionTextureLocked(dest, plume::RenderTextureLayout::SHADER_READ);

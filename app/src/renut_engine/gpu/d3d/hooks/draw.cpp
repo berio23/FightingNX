@@ -44,6 +44,12 @@ using namespace renut::gpu;
 // the marshaling does not skip: the u32 after each double in the hooks'
 // parameters stands in for it.
 
+#if RENUT_GAME_FNC
+// fnc-nx: the LOAD_ALU_CONSTANT loads of FNC since the last draw, copied again into the device image at the
+// draw (defined with the FNC hooks at the end of this file).
+void FncApplyPendingConstantLoads();
+#endif
+
 namespace {
 
 constexpr u32 kE_OUTOFMEMORY = 0x8007000Eu;
@@ -105,6 +111,9 @@ bool ReadVector4(u32 va, float out[4]) {
 // void D3DDevice_DrawVertices(D3DDevice*, D3DPRIMITIVETYPE, UINT StartVertex,
 //                             UINT VertexCount) [0x8222C7A0]
 void D3DDevice_DrawVertices_hook(u32 device, u32 primitive, u32 start_vertex, u32 vertex_count) {
+#if RENUT_GAME_FNC
+  FncApplyPendingConstantLoads();
+#endif
   if (!Active())
     return;
   DrawCall call;
@@ -121,6 +130,9 @@ void D3DDevice_DrawVertices_hook(u32 device, u32 primitive, u32 start_vertex, u3
 //                                    UINT StartIndex, UINT IndexCount) [0x826567C8]
 void D3DDevice_DrawIndexedVertices_hook(u32 device, u32 primitive, u32 base_vertex,
                                         u32 start_index, u32 index_count) {
+#if RENUT_GAME_FNC
+  FncApplyPendingConstantLoads();
+#endif
   if (!Active())
     return;
   DrawCall call;
@@ -143,6 +155,9 @@ void D3DDevice_DrawIndexedVertices_hook(u32 device, u32 primitive, u32 base_vert
 // tessellated on the host (DrawCall::tessellation).
 void D3DDevice_DrawIndexedTessellatedVertices_hook(u32 device, u32 primitive, u32 base_vertex,
                                                    u32 start_index, u32 index_count) {
+#if RENUT_GAME_FNC
+  FncApplyPendingConstantLoads();
+#endif
   if (!Active())
     return;
   DrawCall call;
@@ -162,6 +177,9 @@ void D3DDevice_DrawIndexedTessellatedVertices_hook(u32 device, u32 primitive, u3
 //                               const void *pVertexStreamZeroData, UINT Stride) [0x8222E520]
 void D3DDevice_DrawVerticesUP_hook(u32 device, u32 primitive, u32 vertex_count, u32 data,
                                    u32 stride) {
+#if RENUT_GAME_FNC
+  FncApplyPendingConstantLoads();
+#endif
   if (!Active() || !data)
     return;
   DrawCall call;
@@ -182,6 +200,9 @@ void D3DDevice_DrawVerticesUP_hook(u32 device, u32 primitive, u32 vertex_count, 
 void D3DDevice_DrawIndexedVerticesUP_hook(u32 device, u32 primitive, u32 min_vertex,
                                           u32 num_vertices, u32 index_count, u32 index_data,
                                           u32 index_format, u32 vertex_data, u32 stride) {
+#if RENUT_GAME_FNC
+  FncApplyPendingConstantLoads();
+#endif
   if (!Active() || !index_data || !vertex_data)
     return;
   DrawCall call;
@@ -207,6 +228,9 @@ void D3DDevice_DrawIndexedVerticesUP_hook(u32 device, u32 primitive, u32 min_ver
 // device, so the draw's state is captured now and its vertices copied at the
 // device's next hook (FlushDeferredVertices).
 u32 D3DDevice_BeginVertices_hook(u32 device, u32 primitive, u32 vertex_count, u32 stride) {
+#if RENUT_GAME_FNC
+  FncApplyPendingConstantLoads();
+#endif
   const u64 bytes = u64(vertex_count) * stride;
   if (!bytes || bytes > kVerticesScratchSize)
     return 0;
@@ -659,10 +683,15 @@ BANJO_RENUT_HOOK(sub_82CE4DA0, D3DDevice_BeginVertices_hook);  // D3DDevice_Begi
 // void D3DDevice_ClearF(D3DDevice*, DWORD Flags, const D3DRECT *pRect, const D3DVECTOR4 *pColor, float Z,
 //     DWORD Stencil) [sub_82CE6D10; N&B 0x822811A0]: Z in f1, Stencil in r8. FNC's D3DDevice_Clear (sub_82CE6E38)
 // turns its D3DCOLOR into the float color and calls this, so ClearF is the hook, as in SA2.
+// fnc-nx (2026-11-21): set while FNC's own BeginTiling (sub_82CDA978, below) runs. Its clear of one tile's worth of
+// EDRAM is, on the host, the whole tiled target (Renut's N&B BeginTiling clears with whole_target): as the band-sized
+// rect it cleared only rows 0-255, and the other bands kept the last frame's depth.
+static thread_local bool g_fnc_in_begin_tiling = false;
+
 BANJO_RENUT_HOOK_RAW(sub_82CE6D10) {
   const u32 device = ctx.r3.u32, flags = ctx.r4.u32, rect_va = ctx.r5.u32, color_va = ctx.r6.u32;
   ClearRect rect;
-  const bool has_rect = rect_va && ReadRect(rect_va, rect);
+  const bool has_rect = rect_va && ReadRect(rect_va, rect) && !g_fnc_in_begin_tiling;
   float color[4] = {0, 0, 0, 0};
   if (color_va)
     ReadVector4(color_va, color);
@@ -701,25 +730,38 @@ BANJO_RENUT_HOOK_RAW(sub_82CDD200) {
 // whole view. These wrappers keep the game's own device writes and add only the render thread's state, as Renut's
 // hooks do around N&B's (BeginTiling: the deferred vertices flushed first, then the extent and tiles; EndTiling: after
 // its resolves, which reach the hooked resolve above while the extent is still set, back to none).
+// void D3DDevice_BeginTiling(D3DDevice*, DWORD Flags, DWORD Count, const D3DRECT *pTileRects, ...): the tiles from
+// its own arguments, told to the render thread before it runs, so its clear (whole_target above) and the draws after
+// it already see the full-size target.
 BANJO_RENUT_HOOK_RAW(sub_82CDA978) {
   const u32 device = ctx.r3.u32;
-  if (!IsRecordingCommandBuffer(device))
-    FlushDeferredVertices(device);
-  __imp__sub_82CDA978(ctx, base);
-  native::Device d = native::DeviceAt(device);
-  if (!d || IsRecordingCommandBuffer(device))
-    return;
+  const bool recording = IsRecordingCommandBuffer(device);
   std::vector<ClearRect> tiles;
-  // At most 15: FNC's TileRects (12928) holds 15 rects of 16 bytes before TileOrigins (13168).
-  const u32 count = std::min<u32>(d.W(native::off::TileCount), 15);
   u32 width = 0, height = 0;
-  for (u32 i = 0; i < count; ++i) {
-    const u32 tile = native::off::TileRects + i * 16;
-    ClearRect rect{i32(d.W(tile)), i32(d.W(tile + 4)), i32(d.W(tile + 8)), i32(d.W(tile + 12))};
-    tiles.push_back(rect);
-    width = std::max(width, u32(rect.x2));
-    height = std::max(height, u32(rect.y2));
+  if (!recording) {
+    FlushDeferredVertices(device);
+    // At most 15: FNC's TileRects (12928) holds 15 rects of 16 bytes before TileOrigins (13168).
+    const u32 count = std::min<u32>(ctx.r5.u32, 15), rects_va = ctx.r6.u32;
+    for (u32 i = 0; i < count; ++i) {
+      ClearRect rect;
+      if (!rects_va || !ReadRect(rects_va + i * 16, rect))
+        break;
+      tiles.push_back(rect);
+      width = std::max(width, u32(rect.x2));
+      height = std::max(height, u32(rect.y2));
+    }
+    render_thread::Queue([tiles, width, height] {
+      SetTilingExtentLocked(width, height);
+      SetTilesLocked(tiles.data(), u32(tiles.size()));
+    });
   }
+  g_fnc_in_begin_tiling = true;
+  __imp__sub_82CDA978(ctx, base);
+  g_fnc_in_begin_tiling = false;
+  native::Device d = native::DeviceAt(device);
+  if (!d || recording)
+    return;
+  const u32 count = u32(tiles.size());
   static std::atomic<uint32_t> logged{0};
   if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
     RGPU_INFO("[fnc tiling] BeginTiling: {} tiles, extent {}x{}, first ({},{})-({},{}); predication {:08X}, "
@@ -730,10 +772,89 @@ BANJO_RENUT_HOOK_RAW(sub_82CDA978) {
               d.W(native::off::TilePredication), d.W(native::off::RunPredication), d.B(native::off::Flags),
               d.B(native::off::Flags1), d.B(native::off::Flags2), d.B(native::off::Flags3));
   }
-  render_thread::Queue([tiles, width, height] {
-    SetTilingExtentLocked(width, height);
-    SetTilesLocked(tiles.data(), u32(tiles.size()));
-  });
+}
+
+// fnc-nx (2026-11-21): GPU-owned shader constants. FNC's engine sets most of its shader constants through
+// sub_8245AD18 (vertex) and sub_8245AD90 (pixel) (this, start register, data, count of float4s, mode): mode 1 calls
+// D3D's setter (sub_82CE5B48), which keeps the device's register image; any other mode reserves a SET_CONSTANT packet
+// in the command buffer (sub_82CE5AC0, which returns the packet's data area) and copies the data straight there, so
+// the device's image never has them. Renut reads that image at each draw, so the fights drew with stale constants
+// (the camera and bone matrices): shards everywhere. After the engine's copy, the same data goes into the image too.
+static thread_local u32 g_fnc_owned_device = 0;
+
+BANJO_RENUT_HOOK_RAW(sub_82CE5AC0) {
+  g_fnc_owned_device = ctx.r3.u32;  // D3DDevice*
+  __imp__sub_82CE5AC0(ctx, base);
+}
+
+static void FncMirrorOwnedConstants(bool pixel, u32 start, u32 data_va, u32 count) {
+  const u32 device = g_fnc_owned_device;
+  if (!device || !data_va || !count || start >= 256)
+    return;
+  count = std::min<u32>(count, 256 - start);
+  const u32 image = device + 0x480 + (pixel ? 0x1300u : 0x300u) + start * 16;
+  u8 *dst = GuestPtr<u8>(image);
+  const u8 *src = GuestPtr<const u8>(data_va);
+  if (dst && src)
+    std::memcpy(dst, src, size_t(count) * 16);  // both big-endian guest memory
+  // The groups of four registers written, marked pending as D3D's setter does (m_Pending[0] vertex, [1] pixel at the
+  // device's start, bit 63 - group: FNC's DrawIndexedVertices flushes them from device + 1920 / + 6016): Renut's
+  // snapshot deltas (sa2_renut_snapshot_deltas) take only the pending groups, so without the bits the copies above
+  // never reached a draw (the crowd stayed collapsed).
+  if (auto *pending = GuestPtr<be_u64>(device + (pixel ? 8u : 0u))) {
+    uint64_t bits = uint64_t(*pending);
+    for (u32 g = start / 4; g <= (start + count - 1) / 4 && g < 64; ++g)
+      bits |= uint64_t(1) << (63 - g);
+    *pending = bits;
+  }
+  static std::atomic<uint32_t> logged{0};
+  if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+    RGPU_INFO("[fnc constants] GPU-owned {} constants c{}-c{} mirrored into the device image", pixel ? "pixel" : "vertex",
+              start, start + count - 1);
+}
+
+// Mode 1's setter is no better: sub_82CE5B48 (device, type 0 vertex / 1 pixel, start register, data, count of
+// float4s) writes a LOAD_ALU_CONSTANT packet (0x2F00): the GPU loads the constants from the data's address when it
+// runs it, and the device's image never has them either.
+// The GPU reads the data when it runs the packet, after the CPU has built the frame, so the engine may fill it after
+// this call: the data is copied now and again at the next draw (FncApplyPendingConstantLoads, from the draw hooks),
+// when Renut reads the image for that draw.
+struct FncPendingLoad {
+  u32 device, start, data, count;
+  bool pixel;
+};
+static thread_local std::vector<FncPendingLoad> g_fnc_pending_loads;
+
+BANJO_RENUT_HOOK_RAW(sub_82CE5B48) {
+  const u32 device = ctx.r3.u32, type = ctx.r4.u32, start = ctx.r5.u32, data = ctx.r6.u32, count = ctx.r7.u32;
+  __imp__sub_82CE5B48(ctx, base);
+  g_fnc_owned_device = device;
+  FncMirrorOwnedConstants(type != 0, start, data, count);
+  g_fnc_pending_loads.push_back({device, start, data, count, type != 0});
+}
+
+void FncApplyPendingConstantLoads() {
+  if (g_fnc_pending_loads.empty())
+    return;
+  for (const FncPendingLoad &load : g_fnc_pending_loads) {
+    g_fnc_owned_device = load.device;
+    FncMirrorOwnedConstants(load.pixel, load.start, load.data, load.count);
+  }
+  g_fnc_pending_loads.clear();
+}
+
+BANJO_RENUT_HOOK_RAW(sub_8245AD18) {
+  const u32 start = ctx.r4.u32, data = ctx.r5.u32, count = ctx.r6.u32, mode = ctx.r7.u32;
+  __imp__sub_8245AD18(ctx, base);
+  if (mode != 1)
+    FncMirrorOwnedConstants(false, start, data, count);
+}
+
+BANJO_RENUT_HOOK_RAW(sub_8245AD90) {
+  const u32 start = ctx.r4.u32, data = ctx.r5.u32, count = ctx.r6.u32, mode = ctx.r7.u32;
+  __imp__sub_8245AD90(ctx, base);
+  if (mode != 1)
+    FncMirrorOwnedConstants(true, start, data, count);
 }
 
 BANJO_RENUT_HOOK_RAW(sub_82CDAFE0) {

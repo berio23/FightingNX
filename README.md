@@ -15,16 +15,17 @@ A static recompilation of **Fight Night Champion** (Xbox 360) for the **Nintendo
 
 ## Status
 
-Work in progress. Not playable yet.
+Work in progress. Fights are playable on the Switch, with known graphics issues.
 
 | | Windows (development bench) | Switch |
 |---|---|---|
 | Boots, menus, video cinematics | yes | yes |
-| Fights | 3D geometry broken (renderer) | 3D geometry broken (green, shards) |
-| Frame rate in fights | full speed | 15-17 FPS (CPU-bound; target 30) |
-| Audio | clean | clean in menus, crackles in fights |
+| Fights render (ring, fighters, crowd, HUD) | yes | yes |
+| Known graphics issues | fighter shadows wrong, some gear textures (shorts, gloves) black, thinner crowd | the same |
+| Frame rate in fights | full speed | 13-20 FPS (CPU-bound; target 30) |
+| Audio | clean | clean in menus, some crackle in fights (CPU load) |
 
-The current state of each problem, with measurements and evidence, is in [`docs/fnc/stage3.md`](docs/fnc/stage3.md).
+The state of each problem, with measurements and evidence, is in [`docs/fnc/stage3.md`](docs/fnc/stage3.md).
 
 ## How it works
 
