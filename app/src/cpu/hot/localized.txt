@@ -1,0 +1,3 @@
+# fnc-nx: guest functions replaced by localized copies (tools/localize_native.py), one per line: <address> <what>.
+# Empty: sa2-nx's list named SONIC ADVENTURE 2 addresses (in git history). FNC entries come with stage 3's ARM census
+# (tools/arm_hot_functions.py), each with its measurement and its pixel-identical check.
