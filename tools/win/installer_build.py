@@ -49,7 +49,10 @@ def validate_game(game):
 
 
 def run(*args, env=None, cwd=ROOT):
-    subprocess.run([str(arg) for arg in args], cwd=cwd, env=env, check=True)
+    executable = shutil.which(str(args[0]), path=env.get("PATH") if env else None)
+    if executable is None:
+        raise FileNotFoundError(f"Could not find {args[0]}.")
+    subprocess.run([executable, *map(str, args[1:])], cwd=cwd, env=env, check=True)
 
 
 def stage(message):
