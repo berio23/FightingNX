@@ -180,9 +180,15 @@ def prepare(game, env):
     compile_target(host, "rexglue", env=env)
     generator = ROOT / "sdk/out/win-amd64/rexglue.exe"
     generated = ROOT / "app/generated/rexglue.cmake"
-    if not generated.is_file() or generated.stat().st_mtime < generator.stat().st_mtime:
+    stamp = OUT / "codegen.ok"
+    inputs = (generator, game / "default.xex", ROOT / "app/fnc_manifest.toml",
+              ROOT / "app/overrides.toml", ROOT / "app/perf_overrides.toml",
+              ROOT / "app/codegen_flavor.toml", ROOT / "tools/post_codegen.py")
+    if (not generated.is_file() or not stamp.is_file()
+            or any(path.stat().st_mtime > stamp.stat().st_mtime for path in inputs)):
         run("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-            ROOT / "tools/codegen.ps1", "-Rexglue", generator, env=env)
+            ROOT / "tools/codegen.ps1", "-Rexglue", generator, "-Flavor", "optimised", env=env)
+        stamp.touch()
     SHADERS.mkdir(parents=True, exist_ok=True)
     cmake(ROOT / "app", PC, *common, "-DSA2_RENUT_RENDERER=ON",
           "-DBANJO_RENUT_EARLY_ALPHA=OFF", f"-DFNC_SHADER_DUMP_DIR={SHADERS.as_posix()}",
