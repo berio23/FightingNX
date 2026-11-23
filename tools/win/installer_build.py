@@ -87,11 +87,12 @@ def build_environment(devkit):
     code = (
         "$ErrorActionPreference = 'Stop'; "
         ". (Join-Path $env:FNC_INSTALL_ROOT 'tools/win/env.ps1'); "
+        "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
         "$values = @{}; Get-ChildItem Env: | ForEach-Object { $values[$_.Name] = $_.Value }; "
         "$values | ConvertTo-Json -Compress"
     )
     result = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", code],
-                            cwd=ROOT, env=env, capture_output=True, text=True, errors="replace")
+                            cwd=ROOT, env=env, capture_output=True, encoding="utf-8", errors="replace")
     if result.returncode:
         raise ValueError("Set up Visual Studio Build Tools and LLVM first. " + result.stderr.strip())
     lines = result.stdout.splitlines()
@@ -170,6 +171,7 @@ def prepare(game, env):
     stage("Recompiling your game")
     host = OUT / "host"
     common = ("-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++",
+              "-DCMAKE_C_FLAGS=-march=x86-64-v2", "-DCMAKE_CXX_FLAGS=-march=x86-64-v2",
               "-DCMAKE_TRY_COMPILE_CONFIGURATION=Release", "-DCMAKE_POLICY_VERSION_MINIMUM=3.5")
     cmake(ROOT / "sdk", host, *common, env=env)
     compile_target(host, "rexglue", env=env)
