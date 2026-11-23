@@ -524,15 +524,11 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
 
 void XmaContext::ResetDecoderState() {
   ResetDumpXma(id());  // diagnostic audio_dump_xma_s
-  // A freed or re-initialized context is a new logical stream, so the previous
-  // wave's MDCT overlap-add tail must not survive into frame 0 of the next one.
-  // avcodec_flush_buffers() cannot drop it: ff_xmaframes_decoder declares no
-  // flush callback, so the call never reaches the code clearing channel[].out.
-  // Invalidating the cached format makes PrepareDecoder reopen the codec on the
-  // next decode, which does discard the history.
-  if (av_context_) {
-    av_context_->sample_rate = 0;
-    av_context_->channels = 0;
+  // A freed or re-initialized context is a new logical stream, so clear the overlap-add
+  // buffer and bitstream state via avcodec_flush_buffers() (ff_xmaframes_decoder::flush)
+  // without destroying and rebuilding the VLC tables on every sound reuse.
+  if (av_context_ && avcodec_is_open(av_context_)) {
+    avcodec_flush_buffers(av_context_);
   }
   raw_frame_.fill(0);
   in_silence_ = false;  // a new sound does not inherit the previous one's silence

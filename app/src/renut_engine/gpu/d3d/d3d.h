@@ -315,6 +315,7 @@ constexpr u32 kDeviceOffsetStreamStrides = 12704;      // SetStreamSource, u8[16
 constexpr u32 kDeviceOffsetTextures = 12720;           // SetTexture, [kTextureFetchSlots] [0x3100]
 constexpr u32 kDeviceOffsetPixelShader = 12868;        // SetPixelShader [0x3194]
 constexpr u32 kDeviceOffsetVertexShader = 12872;       // SetVertexShader [0x3198]
+constexpr u32 kDeviceOffsetViewport = 12824;           // SetViewport / GetViewport sub_82CE1120
 #else
 constexpr u32 kDeviceOffsetVertexDeclaration = 12240;  // SetVertexDeclaration [0x2E2C]
 constexpr u32 kDeviceOffsetIndexBuffer = 12812;        // SetIndices [0x3094]
@@ -325,6 +326,7 @@ constexpr u32 kDeviceOffsetStreamStrides = 12904;      // SetStreamSource, u8[16
 constexpr u32 kDeviceOffsetTextures = 12920;           // SetTexture, [kTextureFetchSlots] [0x3100]
 constexpr u32 kDeviceOffsetPixelShader = 13068;        // SetPixelShader [0x3194]
 constexpr u32 kDeviceOffsetVertexShader = 13072;       // SetVertexShader [0x3198]
+constexpr u32 kDeviceOffsetViewport = 0x3168;          // CDevice viewport floats
 #endif
 // In m_TessellatorPacket, which holds registers 0x2280 on: VGT_HOS_CNTL
 // (tessellation mode in bits 0-1: 0 discrete, 1 continuous, 2 adaptive) and

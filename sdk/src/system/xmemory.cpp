@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -1157,6 +1158,50 @@ BaseHeap::BaseHeap() : membase_(nullptr), heap_base_(0), heap_size_(0), page_siz
 
 BaseHeap::~BaseHeap() = default;
 
+// fnc-nx (2026-11-21): first-fit search hints for BaseHeap::AllocRange (its "TODO(benvanik): optimized searching").
+// The scan walked the page table one page at a time from the low (or high) end on every allocation; with the bottom
+// of a heap full that is ~100k entries a call (Switch profile fnc-nx_009: AllocRange 9.5 % of FGGameSim's samples).
+// Per heap, 'low' is a page number with every page below it taken and 'high' one with every page above it taken.
+// Only Release, Reset, Restore and Initialize make pages free, and each moves the hints back, so a scan that starts
+// at a hint returns exactly the address the full scan returns (heap_alloc_hint_verify checks that on every call).
+// Kept outside the class so xmemory.h (and its layout) is unchanged.
+REXCVAR_DEFINE_BOOL(heap_alloc_hint, true, "Memory",
+                    "BaseHeap::AllocRange starts its first-fit scan past the pages known taken (same addresses)");
+REXCVAR_DEFINE_BOOL(heap_alloc_hint_verify, false, "Memory",
+                    "Test of heap_alloc_hint: every allocation also runs the full scan and logs any different result");
+namespace {
+struct HeapHint {
+  std::atomic<const void*> heap{nullptr};
+  std::atomic<uint32_t> low{0};
+  std::atomic<int64_t> high{-1};  // -1: unknown (the top of the table)
+};
+constexpr int kMaxHeapHints = 32;
+HeapHint g_heap_hints[kMaxHeapHints];
+std::mutex g_heap_hints_mutex;
+HeapHint* HintOf(const void* heap) {
+  for (HeapHint& h : g_heap_hints)
+    if (h.heap.load(std::memory_order_acquire) == heap) return &h;
+  std::lock_guard<std::mutex> lock(g_heap_hints_mutex);
+  for (HeapHint& h : g_heap_hints) {
+    const void* cur = h.heap.load(std::memory_order_acquire);
+    if (cur == heap) return &h;
+    if (!cur) {
+      h.low.store(0, std::memory_order_relaxed);
+      h.high.store(-1, std::memory_order_relaxed);
+      h.heap.store(heap, std::memory_order_release);
+      return &h;
+    }
+  }
+  return nullptr;  // table full: no hint (full scans)
+}
+void ResetHint(const void* heap) {
+  if (HeapHint* h = HintOf(heap)) {
+    h->low.store(0, std::memory_order_relaxed);
+    h->high.store(-1, std::memory_order_relaxed);
+  }
+}
+}  // namespace
+
 std::unique_lock<std::recursive_mutex> BaseHeap::AcquireHostPageReconcileLock() const {
   if (page_size_ >= memory_->system_page_size_) {
     return {};
@@ -1293,6 +1338,7 @@ void BaseHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType hea
   host_address_offset_ = host_address_offset;
   page_table_.resize(heap_size / page_size);
   unreserved_page_count_ = uint32_t(page_table_.size());
+  ResetHint(this);  // heap_alloc_hint
 }
 
 void BaseHeap::Dispose() {
@@ -1424,6 +1470,7 @@ bool BaseHeap::Restore(stream::ByteStream* stream) {
   // Restore doesn't take heap_mutex_, but SyncHostPageAccess below still needs
   // the global critical region held by its caller.
   auto global_lock = AcquireHostPageReconcileLock();
+  ResetHint(this);  // heap_alloc_hint
 
   for (size_t i = 0; i < page_table_.size(); i++) {
     auto& page = page_table_[i];
@@ -1494,6 +1541,7 @@ bool BaseHeap::Restore(stream::ByteStream* stream) {
 void BaseHeap::Reset() {
   // TODO(DrChat): protect pages.
   std::memset(page_table_.data(), 0, sizeof(PageEntry) * page_table_.size());
+  ResetHint(this);  // heap_alloc_hint
   // TODO(Triang3l): Remove access callbacks from pages if this is a physical
   // memory heap.
 }
@@ -1677,7 +1725,46 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
   uint32_t start_page_number = UINT_MAX;
   uint32_t end_page_number = UINT_MAX;
   uint32_t page_scan_stride = alignment >> page_size_shift_;
-  uint32_t max_base_page_number = high_page_number + 1 - page_count;
+  const uint32_t full_max_base_page_number = high_page_number + 1 - page_count;
+  const uint32_t full_low_page_number = low_page_number;
+  // heap_alloc_hint: skip the pages known taken (see HeapHint above). The same first fit.
+  HeapHint* hint = REXCVAR_GET(heap_alloc_hint) ? HintOf(this) : nullptr;
+  uint32_t hinted_low_page_number = full_low_page_number;
+  uint32_t hinted_max_base_page_number = full_max_base_page_number;
+  bool hint_no_fit = false;
+  if (hint) {
+    const uint32_t table_size = uint32_t(page_table_.size());
+    uint32_t lo = hint->low.load(std::memory_order_relaxed);
+    while (lo < table_size && page_table_[lo].state != 0) ++lo;
+    hint->low.store(lo, std::memory_order_relaxed);
+    int64_t hi = hint->high.load(std::memory_order_relaxed);
+    if (hi < 0 || hi >= int64_t(table_size)) hi = int64_t(table_size) - 1;
+    while (hi >= 0 && page_table_[size_t(hi)].state != 0) --hi;
+    hint->high.store(hi, std::memory_order_relaxed);
+    if (!top_down) {
+      if (lo > full_low_page_number) {
+        // Every base below 'lo' has its own page taken: start at the first base of the same stride at or past it.
+        const uint64_t start =
+            uint64_t(full_low_page_number) + rex::round_up(lo - full_low_page_number, page_scan_stride);
+        if (start > full_max_base_page_number) {
+          hint_no_fit = true;
+        } else {
+          hinted_low_page_number = uint32_t(start);
+        }
+      }
+    } else {
+      // A range must end at or below 'hi' (every page above it is taken).
+      if (hi + 1 < int64_t(page_count)) {
+        hint_no_fit = true;
+      } else {
+        hinted_max_base_page_number =
+            std::min<uint32_t>(full_max_base_page_number, uint32_t(hi + 1 - int64_t(page_count)));
+      }
+    }
+  }
+  auto scan = [&](uint32_t low_page_number, uint32_t max_base_page_number, uint32_t& start_page_number,
+                  uint32_t& end_page_number) {
+  start_page_number = end_page_number = UINT_MAX;
   if (top_down) {
     max_base_page_number -= max_base_page_number % page_scan_stride;
     for (int64_t base_page_number = max_base_page_number; base_page_number >= low_page_number;
@@ -1747,6 +1834,26 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
       // Retry.
       start_page_number = end_page_number = UINT_MAX;
     }
+  }
+  };
+  if (!hint_no_fit)
+    scan(hinted_low_page_number, hinted_max_base_page_number, start_page_number, end_page_number);
+  if (hint && REXCVAR_GET(heap_alloc_hint_verify)) {
+    uint32_t s2 = UINT_MAX, e2 = UINT_MAX;
+    scan(full_low_page_number, full_max_base_page_number, s2, e2);
+    static std::atomic<uint64_t> checks{0}, differences{0};
+    const uint64_t n = checks.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (s2 != start_page_number || e2 != end_page_number) {
+      differences.fetch_add(1, std::memory_order_relaxed);
+      REXSYS_ERROR("[heap hint] DIFFERENCE heap {:08X}: hinted pages {}-{}, full scan {}-{} (size {} pages, stride {}, "
+                   "top_down {})",
+                   heap_base_, start_page_number, end_page_number, s2, e2, page_count, page_scan_stride, top_down);
+      start_page_number = s2;
+      end_page_number = e2;
+    }
+    if ((n & (n - 1)) == 0)
+      REXSYS_INFO("[heap hint] verify: {} allocations checked, {} differences", n,
+                  differences.load(std::memory_order_relaxed));
   }
   if (start_page_number == UINT_MAX || end_page_number == UINT_MAX) {
     // Out of memory.
@@ -1888,6 +1995,12 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
     auto& page_entry = page_table_[page_number];
     page_entry.qword = 0;
     unreserved_page_count_++;
+  }
+  if (HeapHint* hint = HintOf(this)) {  // heap_alloc_hint: these pages are free again
+    if (hint->low.load(std::memory_order_relaxed) > base_page_number)
+      hint->low.store(base_page_number, std::memory_order_relaxed);
+    const int64_t hi = hint->high.load(std::memory_order_relaxed);
+    if (hi >= 0 && hi < int64_t(end_page_number)) hint->high.store(int64_t(end_page_number), std::memory_order_relaxed);
   }
 
   if (!SyncHostPageAccess(base_page_number, end_page_number)) {

@@ -303,6 +303,9 @@ void ReleaseHostTexturesInMemoryLocked(u32 physical, u32 size);
 void TransitionTextureLocked(HostTexture *texture, plume::RenderTextureLayout layout);
 // banjo-nx (2026-10-19): a layout a texture is only read in (banjo_deko3d_barrier_lean).
 bool ReadOnlyLayout(plume::RenderTextureLayout layout);
+// fnc-nx (2026-11-21): shared deko3d layout transition helper (COPY/RESOLVE transitions in or out require Full barrier).
+void TransitionRenderTextureLocked(plume::RenderTexture *texture, plume::RenderTextureLayout &current,
+                                   plume::RenderTextureLayout layout);
 
 // Rebuilds the host levels of a resolve destination (HostTexture::extra_levels)
 // over 'rect' of level 0, in host texels, after a resolve wrote it. Leaves the

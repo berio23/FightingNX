@@ -85,6 +85,9 @@ int main(int argc, char* argv[]) {
       REXLOG_ERROR("Switch: app initialization failed");
     }
     result = initialized ? app_context.RunMainMessageLoop() : EXIT_FAILURE;
+    if (app_context.AutoExitTriggered()) {
+      ExitProcess(EXIT_SUCCESS);
+    }
 
     app->InvokeOnDestroy();
   }

@@ -341,8 +341,17 @@ namespace plume {
                 return MTL::PixelFormatRGBA8Snorm;
             case RenderFormat::R8G8B8A8_SINT:
                 return MTL::PixelFormatRGBA8Sint;
+            case RenderFormat::R8G8B8A8_USCALED:
+            case RenderFormat::R8G8B8A8_SSCALED:
+                return MTL::PixelFormatInvalid;
             case RenderFormat::B8G8R8A8_UNORM:
                 return MTL::PixelFormatBGRA8Unorm;
+            case RenderFormat::R10G10B10A2_UNORM:
+                return MTL::PixelFormatRGB10A2Unorm;
+            case RenderFormat::R10G10B10A2_SNORM:
+            case RenderFormat::B10G10R10A2_UNORM:
+            case RenderFormat::B10G10R10A2_SNORM:
+                return MTL::PixelFormatInvalid;
             case RenderFormat::R16G16_TYPELESS:
                 return MTL::PixelFormatRG16Float;
             case RenderFormat::R16G16_FLOAT:
@@ -492,6 +501,15 @@ namespace plume {
                 return MTL::VertexFormatChar4Normalized;
             case RenderFormat::R8G8B8A8_SINT:
                 return MTL::VertexFormatChar4;
+            case RenderFormat::R8G8B8A8_USCALED:
+            case RenderFormat::R8G8B8A8_SSCALED:
+                return MTL::VertexFormatInvalid;
+            case RenderFormat::R10G10B10A2_UNORM:
+            case RenderFormat::B10G10R10A2_UNORM:
+                return MTL::VertexFormatUInt1010102Normalized;
+            case RenderFormat::R10G10B10A2_SNORM:
+            case RenderFormat::B10G10R10A2_SNORM:
+                return MTL::VertexFormatInt1010102Normalized;
             case RenderFormat::R16G16_FLOAT:
                 return MTL::VertexFormatHalf2;
             case RenderFormat::R16G16_UNORM:

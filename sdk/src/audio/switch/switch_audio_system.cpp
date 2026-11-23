@@ -40,6 +40,8 @@ REXCVAR_DEFINE_INT32(audio_switch_frames_in_queue, 10, "Audio",
                      "(cushion; 10 = 53 ms, 6 up to build 105). A longer queue lets the game wait without cutting the "
                      "output, at the cost of latency: sa2_audio_wait_server_ms waits up to 30 ms; read "
                      "when the audio is opened");
+REXCVAR_DEFINE_BOOL(audio_switch_conceal_gaps, false, "Audio",
+                    "Smooth silent 256-sample gaps in the stereo mix with one block of lookahead");
 
 namespace rex::audio::nx {
 
@@ -67,6 +69,59 @@ constexpr u64 kWaitTimeoutNs = 100'000'000;
 constexpr u64 kPumpIntervalNs = 1'000'000'000ull * SwitchAudioDriver::kChannelSamples / 48000;
 constexpr size_t kTargetQueuedFrames = 6;
 constexpr size_t kMinQueuedFrames = 2;
+
+// The fight mixer can hand us a whole silent block between two active blocks.
+// A reflected, tapered copy of each neighboring block joins the waveforms
+// without changing active PCM or the playback rate. A longer silence still
+// goes quiet after the first block and ramps back in on the last block.
+class AudioGapConcealer {
+ public:
+  bool Process(int16_t* samples) {
+    bool nonzero = false;
+    for (size_t frame = 0; frame < kFramesPerBuffer; ++frame, samples += kBlockSize) {
+      Block next;
+      std::copy_n(samples, kBlockSize, next.begin());
+      const bool next_active = std::any_of(next.begin(), next.end(), [](int16_t s) { return s != 0; });
+      if (pending_active_) {
+        std::copy(pending_.begin(), pending_.end(), samples);
+        previous_ = pending_;
+        nonzero = true;
+      } else if (previous_active_ || next_active) {
+        for (size_t i = 0; i < kBlockSize; i += 2) {
+          const size_t mirrored = kBlockSize - 2 - i;
+          const float position = float(i) / float(kBlockSize - 2);
+          const float weight = position * position * (3.0f - 2.0f * position);
+          for (size_t channel = 0; channel < 2; ++channel) {
+            const float tail = previous_active_ ? previous_[mirrored + channel] : 0;
+            const float head = next_active ? next[mirrored + channel] : 0;
+            const auto value = static_cast<int16_t>(std::lrint(std::lerp(tail, head, weight)));
+            samples[i + channel] = value;
+            nonzero |= value != 0;
+          }
+        }
+      } else {
+        std::fill_n(samples, kBlockSize, int16_t{0});
+      }
+      previous_active_ = pending_active_;
+      pending_ = next;
+      pending_active_ = next_active;
+    }
+    return nonzero;
+  }
+
+  void Reset() {
+    previous_active_ = false;
+    pending_active_ = false;
+  }
+
+ private:
+  static constexpr size_t kBlockSize = SwitchAudioDriver::kChannelSamples * 2;
+  using Block = std::array<int16_t, kBlockSize>;
+  Block previous_{};
+  Block pending_{};
+  bool previous_active_ = false;
+  bool pending_active_ = false;
+};
 
 }  // namespace
 
@@ -153,12 +208,14 @@ struct SwitchAudioSystem::Output {
   bool thread_created = false;
   std::atomic<bool> running{false};
   bool pump = false;  // audio_switch_pump, read when audio is opened
+  bool conceal_gaps = false;
   size_t frames_in_queue = kTargetQueuedFrames;  // audio_switch_frames_in_queue, read when audio is opened
   bool audout_initialized = false;
   bool audout_started = false;
   std::array<AudioOutBuffer, kBufferCount> buffers{};
   std::array<s16*, kBufferCount> samples{};
   std::array<float, kBufferSamples * 2> mix{};
+  AudioGapConcealer gap_concealer;
 };
 
 std::unique_ptr<AudioSystem> SwitchAudioSystem::Create(
@@ -204,9 +261,11 @@ void SwitchAudioSystem::DestroyDriver(AudioDriver* driver) {
 bool SwitchAudioSystem::StartOutput() {
   auto output = std::make_unique<Output>();
   output->pump = REXCVAR_GET(audio_switch_pump);
+  output->conceal_gaps = REXCVAR_GET(audio_switch_conceal_gaps);
   output->frames_in_queue = static_cast<size_t>(std::clamp(REXCVAR_GET(audio_switch_frames_in_queue), 2, 32));
-  REXLOG_INFO("SwitchAudioSystem: 187.5 Hz pump {}, {} frames queued", output->pump ? "active" : "off",
-              output->frames_in_queue);
+  REXLOG_INFO("SwitchAudioSystem: 187.5 Hz pump {}, {} frames queued, gap concealment {}",
+              output->pump ? "active" : "off", output->frames_in_queue,
+              output->conceal_gaps ? "on" : "off");
 
   Result rc = audoutInitialize();
   if (R_FAILED(rc)) {
@@ -378,6 +437,7 @@ void SwitchAudioSystem::FillAndAppend(size_t buffer_index) {
   uint32_t saturated = 0;
   if (REXCVAR_GET(audio_mute)) {
     std::memset(samples, 0, kBufferBytes);
+    output.gap_concealer.Reset();
   } else {
     for (size_t i = 0; i < output.mix.size(); ++i) {
       const float value = std::isfinite(output.mix[i]) ? output.mix[i] : 0.0f;
@@ -386,6 +446,9 @@ void SwitchAudioSystem::FillAndAppend(size_t buffer_index) {
       saturated += magnitude > 1.0f ? 1 : 0;
       samples[i] = static_cast<s16>(std::lrint(std::clamp(value, -1.0f, 1.0f) * 32767.0f));
       pcm_nonzero |= samples[i] != 0;
+    }
+    if (output.conceal_gaps) {
+      pcm_nonzero = output.gap_concealer.Process(samples);
     }
   }
   DumpOutput(samples, output.mix.size());

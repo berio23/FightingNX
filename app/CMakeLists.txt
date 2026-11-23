@@ -84,8 +84,19 @@ set(SA2_SOURCES
     # the hex constants in the forms check are float bit patterns, not guest addresses).
     src/cpu/sa2_codegen_checks.cpp
     src/cpu/sa2_forms_selfcheck.cpp
+    src/fnc/fnc_hot_guest.cpp
+    src/cpu/sa2_hot_bulk_0.cpp
+    src/cpu/sa2_hot_bulk_1.cpp
+    src/cpu/sa2_hot_bulk_2.cpp
+    src/cpu/sa2_hot_bulk_3.cpp
 )
-set(SA2_HOT_SOURCES "")
+set(SA2_HOT_SOURCES
+    src/fnc/fnc_hot_guest.cpp
+    src/cpu/sa2_hot_bulk_0.cpp
+    src/cpu/sa2_hot_bulk_1.cpp
+    src/cpu/sa2_hot_bulk_2.cpp
+    src/cpu/sa2_hot_bulk_3.cpp
+)
 # Diagnostic builds only (e.g. the Direct3D census: out/census/sa2_d3d_census_all.cpp): extra sources, empty by default.
 set(SA2_EXTRA_SOURCES "" CACHE STRING "Extra source files for diagnostic builds (empty for normal builds)")
 if(SA2_EXTRA_SOURCES MATCHES "census")

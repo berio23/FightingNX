@@ -54,20 +54,17 @@ void ObjectTable::Reset() {
 
 X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot) {
   // Find a free slot.
-  uint32_t slot = last_free_entry_;
-  uint32_t scan_count = 0;
-  while (scan_count < table_capacity_) {
+  uint32_t slot = (last_free_entry_ > 0 && last_free_entry_ < table_capacity_) ? last_free_entry_ : 1;
+  for (uint32_t scan_count = 1; scan_count < table_capacity_; ++scan_count) {
     ObjectTableEntry& entry = table_[slot];
     if (!entry.object) {
       *out_slot = slot;
+      last_free_entry_ = (slot + 1 < table_capacity_) ? (slot + 1) : 1;
       return X_STATUS_SUCCESS;
     }
-    scan_count++;
-    slot = (slot + 1) % table_capacity_;
-    if (slot == 0) {
+    if (++slot >= table_capacity_) {
       // Never allow 0 handles.
-      scan_count++;
-      slot++;
+      slot = 1;
     }
   }
 
@@ -78,7 +75,8 @@ X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot) {
   }
 
   // Never allow 0 handles.
-  slot = ++last_free_entry_;
+  slot = std::max(1u, last_free_entry_);
+  last_free_entry_ = (slot + 1 < table_capacity_) ? (slot + 1) : 1;
   *out_slot = slot;
 
   return X_STATUS_SUCCESS;
@@ -203,6 +201,10 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
     entry->object = nullptr;
     assert_zero(entry->handle_ref_count);
     entry->handle_ref_count = 0;
+    const uint32_t slot = GetHandleSlot(handle);
+    if (slot > 0 && slot < last_free_entry_) {
+      last_free_entry_ = slot;
+    }
 
     // Walk the object's handles and remove this one.
     auto handle_entry = std::find(object->handles().begin(), object->handles().end(), handle);
@@ -249,6 +251,7 @@ void ObjectTable::PurgeAllObjects() {
       entry.object = nullptr;
     }
   }
+  last_free_entry_ = 1;
 }
 
 ObjectTable::ObjectTableEntry* ObjectTable::LookupTable(X_HANDLE handle) {

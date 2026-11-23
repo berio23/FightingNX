@@ -726,7 +726,7 @@ HostTexture *DepthWordsSource(const TextureFetch &fetch) {
 // every draw binds its textures again: the draws after a resolve read its words either way. So only a texture of that
 // format, size and one level, sampled through its own view's description with the fetch's swizzle.
 uint32_t WordsViewSlot(HostTexture &t, HostTexture &source, u32 swizzle) {
-  if (!banjo::renut_gpu::DepthWordsViewOn() || !source.words || !source.words->texture ||
+  if ((!banjo::renut_gpu::DepthWordsViewOn() && !t.gpu_written) || !source.words || !source.words->texture ||
       t.host_format != kDepthResolveWordsFormat || t.dimension != TextureDimension::Tex2D || t.stacked ||
       t.mip_levels != 1 || t.alloc_width != source.words->alloc_width || t.alloc_height != source.words->alloc_height)
     return UINT32_MAX;
@@ -736,7 +736,7 @@ uint32_t WordsViewSlot(HostTexture &t, HostTexture &source, u32 swizzle) {
   }
   plume::RenderTextureViewDesc desc = t.view_desc;
   desc.mipLevels = 1;
-  desc.componentMapping = SwizzleMapping(swizzle, t.view_swap_red_blue, t.host_format);
+  desc.componentMapping = SwizzleMapping(swizzle, false, t.host_format);
   HostTexture::WordsView v;
   v.swizzle = swizzle;
   v.view = source.words->texture->createTextureView(desc);
@@ -1159,23 +1159,33 @@ bool ReadOnlyLayout(plume::RenderTextureLayout layout) {
          layout == plume::RenderTextureLayout::COPY_SOURCE || layout == plume::RenderTextureLayout::RESOLVE_SOURCE;
 }
 
-void TransitionTextureLocked(HostTexture *texture, plume::RenderTextureLayout layout) {
-  if (!texture || !texture->texture || texture->layout == layout)
+static bool IsCopyOrResolveLayout(plume::RenderTextureLayout layout) {
+  return layout == plume::RenderTextureLayout::COPY_SOURCE || layout == plume::RenderTextureLayout::COPY_DEST ||
+         layout == plume::RenderTextureLayout::RESOLVE_SOURCE || layout == plume::RenderTextureLayout::RESOLVE_DEST;
+}
+
+void TransitionRenderTextureLocked(plume::RenderTexture *texture, plume::RenderTextureLayout &current,
+                                   plume::RenderTextureLayout layout) {
+  if (!texture || current == layout)
     return;
-  if (IsDeko3D() && banjo::renut_gpu::Deko3DBarrierLeanOn() && ReadOnlyLayout(texture->layout) &&
+  const bool copy = IsCopyOrResolveLayout(current) || IsCopyOrResolveLayout(layout);
+  if (IsDeko3D() && banjo::renut_gpu::Deko3DBarrierLeanOn() && !copy && ReadOnlyLayout(current) &&
       ReadOnlyLayout(layout)) {
-    texture->layout = layout;
+    current = layout;
     return;
   }
   plume::RenderCommandList *cmd = Video::CommandListLocked();
   if (!cmd)
     return;
-  const bool copy = layout == plume::RenderTextureLayout::COPY_DEST ||
-                    layout == plume::RenderTextureLayout::COPY_SOURCE ||
-                    layout == plume::RenderTextureLayout::RESOLVE_DEST;
   cmd->barriers(copy ? plume::RenderBarrierStage::COPY : plume::RenderBarrierStage::GRAPHICS,
-                plume::RenderTextureBarrier(texture->texture.get(), layout));
-  texture->layout = layout;
+                plume::RenderTextureBarrier(texture, layout));
+  current = layout;
+}
+
+void TransitionTextureLocked(HostTexture *texture, plume::RenderTextureLayout layout) {
+  if (!texture)
+    return;
+  TransitionRenderTextureLocked(texture->texture.get(), texture->layout, layout);
 }
 
 TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetch, BindEffects *fx) {
@@ -1249,15 +1259,6 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
     resolved->used_frame = g_frame;
     if (resolved->words)
       banjo::renut_gpu::CountDepthFloatSampled();  // banjo-nx (2026-10-18): a depth resolve's float target sampled
-    // fnc-nx (2026-11-21, diagnostic): the game's own fetch format for a resolved depth target it samples (the
-    // fighters' shadow map reads as empty), against the host texture it is given.
-    if (resolved->words || (resolved->width == 512 && resolved->height == 512)) {
-      static std::atomic<uint32_t> logged{0};
-      if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
-        RGPU_INFO("[fnc depth sample] texture {:08X}: guest format {} (endian {}, swizzle {:03X}, {}x{}), depth words {}",
-                  texture_va, u32(fetch.Format()), fetch.Endian(), fetch.Swizzle(), resolved->width, resolved->height,
-                  resolved->words != nullptr);
-    }
     ColourHandOverBeforeReadLocked(*resolved);  // sa2-nx (2026-10-28, sa2_renut_colour_handover)
     FlushResolveMipsLocked(*resolved);  // sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips)
     TransitionTextureLocked(resolved, plume::RenderTextureLayout::SHADER_READ);
@@ -1307,15 +1308,16 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
     slot.reset();
   }
   // What a depth resolve wrote to the memory (only the GPU has it), which is
-  // at the resolve's scale; guest data is at the guest size.
-  HostTexture *depth_source = !(slot && slot->gpu_written) ? DepthWordsSource(fetch) : nullptr;
-  // fnc-nx (2026-11-21, diagnostic): the 512x512 shadow map is sampled as its own resolve destination (this path, not
-  // ResolvedAlias): the game's fetch format for it, and what Renut holds.
-  if (slot && slot->gpu_written && slot->width == 512 && slot->height == 512) {
-    static std::atomic<uint32_t> logged{0};
-    if (logged.fetch_add(1, std::memory_order_relaxed) < 6)
-      RGPU_INFO("[fnc depth sample] own resolve {:08X}: guest format {} (endian {}, swizzle {:03X}), depth words {}",
-                texture_va, u32(fetch.Format()), fetch.Endian(), fetch.Swizzle(), slot->words != nullptr);
+  // at the resolve's scale; guest data is at the guest size. A texture that is
+  // also a colour resolve target over the same base page (e.g. FNC's 512x512
+  // flat shadow map BD1EF840, which blurs the stencil of depth resolve
+  // BD1EF800 and resolves back into BD1EF840) samples the depth words after
+  // the depth resolve and its own colour resolve after the blur pass.
+  HostTexture *depth_source = DepthWordsSource(fetch);
+  if (depth_source && slot && slot->gpu_written) {
+    auto it = g_resolve_targets.find(fetch.BasePage());
+    if (it == g_resolve_targets.end() || it->second != depth_source)
+      depth_source = nullptr;
   }
   if (depth_source) {
     EnsureDepthWordsLocked(*depth_source);  // banjo-nx (banjo_renut_depth_words_lazy)
@@ -1368,7 +1370,7 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
     return binding;
   t.used_frame = g_frame;
 
-  if (depth_source && !t.gpu_written) {
+  if (depth_source) {
     // banjo-nx (banjo_gpu_depth_words_view, package 28): the resolve's words themselves, not a copy.
     if (const uint32_t words_slot = WordsViewSlot(t, *depth_source, swizzle); words_slot != UINT32_MAX) {
       t.copied_resolve = 0;  // its own texture has not got them: copied in full if the view is not used later

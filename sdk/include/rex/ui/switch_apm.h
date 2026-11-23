@@ -27,6 +27,8 @@ void RexSwitchApmCpuBoost(int mode);
  * before RexSwitchApmApply.
  */
 void RexSwitchApmAllowRam1600(int allow);
+// fnc-nx (2026-11-21): try the GPU clock's RAM 1600 configuration (0x92220007 for 460) first; implies allow.
+void RexSwitchApmPreferRam1600(int prefer);
 
 /*
  * Requests the profile. Does nothing if 0 was requested, if the console is docked, or if it was

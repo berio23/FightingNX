@@ -119,7 +119,13 @@ namespace plume {
         case RenderFormat::R8G8B8A8_UINT: return DkImageFormat_RGBA8_Uint;
         case RenderFormat::R8G8B8A8_SNORM: return DkImageFormat_RGBA8_Snorm;
         case RenderFormat::R8G8B8A8_SINT: return DkImageFormat_RGBA8_Sint;
+        case RenderFormat::R8G8B8A8_USCALED:
+        case RenderFormat::R8G8B8A8_SSCALED: return DkImageFormat_None;
         case RenderFormat::B8G8R8A8_UNORM: return DkImageFormat_BGRA8_Unorm;
+        case RenderFormat::R10G10B10A2_UNORM: return DkImageFormat_RGB10A2_Unorm;
+        case RenderFormat::R10G10B10A2_SNORM:
+        case RenderFormat::B10G10R10A2_UNORM:
+        case RenderFormat::B10G10R10A2_SNORM: return DkImageFormat_None;
         case RenderFormat::R16G16_TYPELESS:
         case RenderFormat::R16G16_FLOAT: return DkImageFormat_RG16_Float;
         case RenderFormat::R16G16_UNORM: return DkImageFormat_RG16_Unorm;
@@ -245,7 +251,13 @@ namespace plume {
         case RenderFormat::R8G8B8A8_SNORM: size = DkVtxAttribSize_4x8; type = DkVtxAttribType_Snorm; return true;
         case RenderFormat::R8G8B8A8_UINT: size = DkVtxAttribSize_4x8; type = DkVtxAttribType_Uint; return true;
         case RenderFormat::R8G8B8A8_SINT: size = DkVtxAttribSize_4x8; type = DkVtxAttribType_Sint; return true;
+        case RenderFormat::R8G8B8A8_USCALED: size = DkVtxAttribSize_4x8; type = DkVtxAttribType_Uscaled; return true;
+        case RenderFormat::R8G8B8A8_SSCALED: size = DkVtxAttribSize_4x8; type = DkVtxAttribType_Sscaled; return true;
         case RenderFormat::B8G8R8A8_UNORM: size = DkVtxAttribSize_4x8; type = DkVtxAttribType_Unorm; bgra = true; return true;
+        case RenderFormat::R10G10B10A2_UNORM: size = DkVtxAttribSize_10_10_10_2; type = DkVtxAttribType_Unorm; return true;
+        case RenderFormat::R10G10B10A2_SNORM: size = DkVtxAttribSize_10_10_10_2; type = DkVtxAttribType_Snorm; return true;
+        case RenderFormat::B10G10R10A2_UNORM: size = DkVtxAttribSize_10_10_10_2; type = DkVtxAttribType_Unorm; bgra = true; return true;
+        case RenderFormat::B10G10R10A2_SNORM: size = DkVtxAttribSize_10_10_10_2; type = DkVtxAttribType_Snorm; bgra = true; return true;
         case RenderFormat::R8G8_UNORM: size = DkVtxAttribSize_2x8; type = DkVtxAttribType_Unorm; return true;
         case RenderFormat::R8G8_SNORM: size = DkVtxAttribSize_2x8; type = DkVtxAttribType_Snorm; return true;
         case RenderFormat::R8G8_UINT: size = DkVtxAttribSize_2x8; type = DkVtxAttribType_Uint; return true;

@@ -86,6 +86,13 @@ def main():
     # Functions without their own section or that must not move: the start-up code is placed first explicitly.
     for skip in ('_start', '__libnx_init', '??'):
         weight.pop(skip, None)
+    # fnc-nx (2026-11-21): a recompiled function's body is __imp__sub_X (GCC: sub_X is a weak alias at the same
+    # address, which nm may list instead), and its section is .text.__imp__sub_X. Listing only .text.sub_X matched
+    # no section, so the game's functions were never moved. Both names are folded into one entry and both listed.
+    merged = collections.Counter()
+    for n, w in weight.items():
+        merged[n[len('__imp__'):] if n.startswith('__imp__sub_') else n] += w
+    weight = merged
     hot = [n for n, _ in weight.most_common(a.count)]
     lines = ['/*',
              f' * Hot functions grouped at the start of .text ({len(hot)} of them, hottest first), from console stack',
@@ -96,7 +103,7 @@ def main():
              '  KEEP (*(.crt0))',
              '  /* newlib assembly routines without their own section: by archive member */']
     lines += [f'  *libc.a:libc_a-{n}.o(.text .text.*)' for n in libc]
-    lines += [f'  *(.text.{n})' for n in hot]
+    lines += [f'  *(.text.__imp__{n} .text.{n})' if n.startswith('sub_') else f'  *(.text.{n})' for n in hot]
     lines.append('}')
     with open(a.out, 'w', encoding='utf-8', newline='\n') as f:
         f.write('\n'.join(lines) + '\n')

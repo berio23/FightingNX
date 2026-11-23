@@ -19,9 +19,11 @@
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/rex_app.h>
 #include <rex/runtime.h>
 
+#include "cpu/sa2_enhancements.h"
 #include "profiler/sa2_cpu_profile_pc.h"
 #include "sa2_capture.h"
 #include "sa2_pgo.h"
@@ -30,6 +32,9 @@
 #include <windows.h>
 #include "fnc_modules.h"
 #endif
+#if REX_PLATFORM_SWITCH
+#include <rex/ui/windowed_app_context_switch.h>
+#endif
 
 // Stage 2: Renut's Direct3D-level renderer (src/renut_engine/gpu, retargeted to FNC: RENUT_GAME_FNC), chosen at boot
 // with sa2_renderer = "renut". The wiring is sa2-nx's Sa2App's (src/sa2_app.h).
@@ -37,6 +42,16 @@
 #include "renut_engine/gpu/banjo_renut_select.h"
 #include "renut_engine/gpu/overlay/app_integration.h"
 #include "renut_engine/gpu/banjo_renut_capture.h"
+#endif
+
+REXCVAR_DECLARE(bool, fnc_gpu_boost);  // fnc/fnc_hooks.cpp
+REXCVAR_DECLARE(bool, fnc_ram_1600);
+#if REX_PLATFORM_SWITCH
+extern "C" {
+void RexSwitchApmRequestGpuMhz(int mhz);  // sdk/src/ui/switch_apm.cpp (Switch build only)
+void RexSwitchApmPreferRam1600(int prefer);
+void RexSwitchApmApply(void);
+}
 #endif
 
 namespace fnc_prof {
@@ -61,9 +76,27 @@ class FncApp : public rex::ReXApp {
   }
 
   void OnPostInitLogging() override {
-    if (!rex::cvar::HasNonDefaultValue("gpu_plugin")) {
+    if (rex::cvar::GetFlagSource("gpu_plugin") == rex::cvar::Source::kDefault) {
       rex::cvar::SetFlagByName("gpu_plugin", "xenos");
     }
+    // Disable deko3d multi-pass options or non-CPU bundles not yet proven cleanly on FNC.
+    // The 6 Switch GPU opts (zcull, depth_compression, depth24, depth_handover, barrier_lean, draw_resolves)
+    // passed full Switch verification in gpu_opt_02 and stay on by default.
+    // Lower IO range-cache floor for 22-34 KB audio streams.
+    // Use GetFlagSource() == kDefault (not HasNonDefaultValue()) so explicit TOML overrides matching defaults apply.
+    for (const char* key : {"sa2_cpu_enhancements", "banjo_renut_store_cards"}) {
+      if (rex::cvar::GetFlagSource(key) == rex::cvar::Source::kDefault) rex::cvar::SetFlagByName(key, "true");
+    }
+    if (rex::cvar::GetFlagSource("sa2_noncpu_enhancements") == rex::cvar::Source::kDefault) {
+      rex::cvar::SetFlagByName("sa2_noncpu_enhancements", "false");
+    }
+    if (rex::cvar::GetFlagSource("sa2_io_ranges_min_kb") == rex::cvar::Source::kDefault) {
+      rex::cvar::SetFlagByName("sa2_io_ranges_min_kb", "16");
+    }
+    if (rex::cvar::GetFlagSource("sa2_io_windows_max") == rex::cvar::Source::kDefault) {
+      rex::cvar::SetFlagByName("sa2_io_windows_max", "32");
+    }
+    sa2::enh::Resolve();
   }
 
   // Without --game_data_root: a game_root/ folder next to the executable or above it (the repository's
@@ -102,6 +135,16 @@ class FncApp : public rex::ReXApp {
   // With Renut's renderer chosen: no SDK graphics system and no GPU plugin (ReXApp loads the plugin only when
   // config.graphics is empty and this returns before it is chosen); Renut has its own window swapchain and thread.
   void OnPreSetup(rex::RuntimeConfig& config) override {
+    // fnc-nx (2026-11-21): handheld, Nintendo's official 460.8 MHz GPU profile (0x92220008, memory unchanged; the
+    // SDK checks the clocks and reverts, and asks nothing when docked). Switch log fnc-nx_009: the GPU sat at
+    // 307.2 MHz, 25-27 ms a fight frame. Not an SA2 enhancement: its own key, off with fnc_gpu_boost = false.
+#if REX_PLATFORM_SWITCH
+    if (REXCVAR_GET(fnc_gpu_boost)) {
+      RexSwitchApmRequestGpuMhz(460);
+      RexSwitchApmPreferRam1600(REXCVAR_GET(fnc_ram_1600) ? 1 : 0);  // 0x92220007: memory 1600 (official)
+      RexSwitchApmApply();  // logs what it did on stderr (logs/rex/rex_stderr.log)
+    }
+#endif
     if (banjo::renut_gpu::Active()) {
       renut::gpu::ConfigureRuntime(config);
       REXLOG_INFO("graphics: Renut's Direct3D-level renderer (sa2_renderer = renut: no PM4 ring, no EDRAM)");
@@ -125,8 +168,12 @@ class FncApp : public rex::ReXApp {
 #endif
 
   void OnPostSetup() override {
+#if REX_PLATFORM_SWITCH
+    rex::ui::SetSwitchAutoExitBusyCheck(&sa2::capture::IsActive);
+#endif
     fnc_prof::Start(PPCImageConfig.func_mappings);
     nfsmw::perfil_pc::Arrancar();
+    sa2::enh::StartReport();
 #if SA2_RENUT_RENDERER
     if (banjo::renut_gpu::Active()) {
       // Renut's Swap hook counts the game frames itself (g_sa2_game_frames): no swap-count poller.

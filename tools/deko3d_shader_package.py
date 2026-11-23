@@ -26,7 +26,7 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ZSTD = r'C:\devkitPro\msys2\usr\bin\zstd.exe'
+ZSTD = os.environ.get('FNC_ZSTD', r'C:\devkitPro\msys2\usr\bin\zstd.exe')
 
 
 def fwd(p):
@@ -50,8 +50,8 @@ def main():
                        check=True)
         zdir = fwd(os.path.relpath(os.path.join(tmp, 'z')))
         os.makedirs(zdir, exist_ok=True)
-        for i in range(0, len(files), 300):
-            subprocess.run([ZSTD, f'-{a.level}', '-q', '-f', '-D', dict_path, '--output-dir-flat', zdir] + files[i:i + 300],
+        for i in range(0, len(files), 100):
+            subprocess.run([ZSTD, f'-{a.level}', '-q', '-f', '-D', dict_path, '--output-dir-flat', zdir] + files[i:i + 100],
                            check=True)
         dictionary = open(dict_path, 'rb').read()
         entries = []

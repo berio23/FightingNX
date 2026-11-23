@@ -158,7 +158,11 @@ std::atomic<u32> g_num_hitches{0};
 Sample g_samples[kMaxSamples];
 size_t g_sample_count = 0;
 
-std::atomic<u64> g_counters[kCounterCount];
+struct alignas(64) PerfCounter {
+  std::atomic<u64> v{0};
+};
+PerfCounter g_counters[kCounterCount];
+std::atomic<bool> g_perf_report_active{false};
 
 /*
  * Wrapped libnx calls (see the file header): how many, how much time inside and, where it makes
@@ -416,7 +420,7 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
 
   u64 counters_now[kCounterCount];
   for (unsigned i = 0; i < kCounterCount; ++i) {
-    counters_now[i] = g_counters[i].load(std::memory_order_relaxed);
+    counters_now[i] = g_counters[i].v.load(std::memory_order_relaxed);
   }
 
   // CPU of each thread over the interval, as % of one core.
@@ -493,7 +497,7 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
   // Mix clipping before conversion to 16 bits (21 samples above 1.0, 22 buffers with a peak of 0.98 or
   // more, 23 maximum peak of the interval in ten-thousandths) and the console mode, for the crackling
   // in handheld mode.
-  const u64 audio_peak = g_counters[23].exchange(0, std::memory_order_relaxed);
+  const u64 audio_peak = g_counters[23].v.exchange(0, std::memory_order_relaxed);
   std::fprintf(f,
                "     audio: %.0f client blocks mixed, %.0f requests without data, "
                "%.0f/%.0f audout buffers with non-zero PCM, %.0f saturated samples (above 1.0 before clipping), "
@@ -864,7 +868,7 @@ struct TicOverlay {
 
   void Boot(u64 now) {
     tic = now;
-    presented = g_counters[0].load(std::memory_order_relaxed);
+    presented = g_counters[0].v.load(std::memory_order_relaxed);
     // Publish what is known right away: the resolution is valid from the first instant (g_resolution
     // starts at 1280x720 and the game corrects it when choosing the video mode), so the overlay's RES
     // row can show up even before the first frame.
@@ -879,7 +883,7 @@ struct TicOverlay {
       return;
     }
     const double seconds = double(now - tic) / double(freq);
-    const u64 presented_now = g_counters[0].load(std::memory_order_relaxed);
+    const u64 presented_now = g_counters[0].v.load(std::memory_order_relaxed);
     const double fps = seconds > 0.0 ? double(presented_now - presented) / seconds : 0.0;
     media[pos] = fps;
     pos = (pos + 1) % 10;
@@ -1000,10 +1004,11 @@ void ProfilerMain(void*) {
   // overlay's FPS and resolution keep going.
   const bool report = rex::cvar::GetFlagByName("switch_profile_report") != "false";
   if (!report) sample_stacks = false;
+  g_perf_report_active.store(report || sample_stacks, std::memory_order_relaxed);
 
   u64 counters_last[kCounterCount]{};
   for (unsigned i = 0; i < kCounterCount; ++i) {
-    counters_last[i] = g_counters[i].load(std::memory_order_relaxed);
+    counters_last[i] = g_counters[i].v.load(std::memory_order_relaxed);
   }
   if (report) RexSwitchEnsureLogDir();
   if (FILE* f = report ? std::fopen(ReportPath().c_str(), "w") : nullptr) {
@@ -1251,7 +1256,7 @@ void RexSwitchPerfIntervalSwap(unsigned vblanks) {
 
 void RexSwitchPerfCount(unsigned id) {
   if (id < kCounterCount) {
-    g_counters[id].fetch_add(1, std::memory_order_relaxed);
+    g_counters[id].v.fetch_add(1, std::memory_order_relaxed);
   }
   if (id == 0) {
     // Counter 0 is presents. The console overlay clears the "alive" mark and the resolution mark and
@@ -1271,8 +1276,11 @@ void RexSwitchPerfCount(unsigned id) {
  * 21 clipped audio samples, 22 audio buffers with a peak of 0.98 or more.
  */
 void RexSwitchPerfAdd(unsigned id, u64 value) {
+  if (id >= 40 && !g_perf_report_active.load(std::memory_order_relaxed)) {
+    return;
+  }
   if (id < kCounterCount) {
-    g_counters[id].fetch_add(value, std::memory_order_relaxed);
+    g_counters[id].v.fetch_add(value, std::memory_order_relaxed);
   }
 }
 
@@ -1281,8 +1289,8 @@ void RexSwitchPerfMax(unsigned id, u64 value) {
   if (id >= kCounterCount) {
     return;
   }
-  u64 actual = g_counters[id].load(std::memory_order_relaxed);
-  while (value > actual && !g_counters[id].compare_exchange_weak(actual, value, std::memory_order_relaxed)) {
+  u64 actual = g_counters[id].v.load(std::memory_order_relaxed);
+  while (value > actual && !g_counters[id].v.compare_exchange_weak(actual, value, std::memory_order_relaxed)) {
   }
 }
 

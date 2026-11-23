@@ -288,3 +288,120 @@ fights.
    - **Shorts and gloves both render and look good on Switch** (verified by user on console).
    - **Remaining on Switch:** fights are playable but still very laggy (CPU-bound); **sporadic black artifacts**
      sometimes appear on fighters' bodies; **shadows are still black boxes** (still open).
+
+
+## Shadows and CPU round (2026-11-21, evening)
+
+### Root causes
+1. **No enhancement switch was ever active on FNC.** `FncApp` never called `sa2::enh::Resolve()`, so every
+   `SA2_ENHANCEMENT` (`banjo_renut_capture_pool`, `banjo_renut_depth_words_stencil`, store cards, NEON paths, ...) had
+   `.active == false`. Symptoms: `new`/`delete` of a `DrawCapture` per draw (Run 5 profile: `_malloc_r` 15.1 % of
+   `FGGameRender`, `_free_r` 5.2 % of the render thread) and the depth-words resolve never given the stencil view.
+   Fix: `fnc_app.h` calls `sa2::enh::Resolve()` (OnPostInitLogging) and `StartReport()` (OnPostSetup).
+2. **Stencil never reached `depth_resolve.hlsli` on D3D12.** `SurfaceStencilSlotLocked` was Vulkan/deko3d-only and plume's
+   D3D12 back end had no stencil SRV. Fix: `RenderFormat::S8_UINT` view (`X32_TYPELESS_G8X24_UINT` /
+   `X24_TYPELESS_G8_UINT`, `PlaneSlice = 1`) in `plume_d3d12.cpp`; the gate removed in `surfaces.cpp`.
+3. **`flatShadowTextureSampler` (BD1EF840) froze on its first frame.** It is both a depth-words consumer and a colour
+   resolve target on the same base page; `BindTextureLocked` skipped `DepthWordsSource` once `gpu_written` was set, and
+   `WordsViewSlot` applied the colour target's red/blue swap to the raw words. Fix in `textures.cpp`.
+4. `draw.cpp` `sa2_renut_chain_reuse` compared SA2's device offsets (12816..12835, 12920..13023); now FNC's
+   `kDeviceOffsetRenderTargets..DepthStencil+3` and `kDeviceOffsetTextures..+kTextureFetchSlots*4-1`.
+
+### CPU / render thread
+- `src/fnc/fnc_hot_guest.cpp`: `g_banjo_store_cards = true` (the generated pch defines `REX_CARD`; was hard-coded
+  false in `fnc_stage1_stubs.cpp`), and guarded native replacements (first 256 calls + 1 in 4096 checked against the
+  original): `sub_8229B520` (CRT memcpy), `sub_82A8B590` (8-wide IIR filter loop, no loop barrier; declines
+  `r7 % 8 != 0`), `sub_82A8C308` (vmaddfp array accumulate, no loop barrier).
+  `sub_8283B828` was tried and **removed**: the guard found `r3` 0x1f5 vs 0x1f4 (fnc-nx_073.log) on its first fight call.
+- `xma_decoder.cpp`: no spurious worker wake-up in mode 0. `vertex_format.cpp`: NEON half floats, compile-time
+  normalised decode, identity-swizzle fast path.
+
+### PC verification (fnc-nx_073.log, same input script, fresh profile, `--banjo_renut_store_cards_verify=true`)
+- Fresh `BD1EF840.z` in the fight: 88.6 % = 255 (lit), 7.2 % = 0 (shadow), 4.1 % soft edge — a fighter silhouette, no box.
+- Store cards: ~86k copies a 10 s window proven by cards (~3.0-3.3 GB not hashed), `0 changed under clean cards`,
+  `0 textures changed under clean cards`. Render thread 0.65-7.7 ms, GPU 3-8 ms a frame (D3D12, GTX 1070).
+- 300 frames vs `fnc-ref-recorder` `video_105s.rgba` (640x360): ±15-aligned MAD **2.75** (active frames 2.99), was
+  15.10 / 11.98 after the gear fix. Fight frames 130/150/180/210: MAD 2.8-3.9, ring floor ROI 3.9-4.5; by eye the
+  fighter shadows on the canvas match the reference. Knockdown 238/252: MAD 7.7/9.6 — the remaining gap is the thinner
+  crowd (issue 3), not shadows. Frames 0-1 differ only because the reference is 12 frames ahead there.
+- **Not verified:** Switch console run of this build; sporadic black body artifacts (not reproduced on PC).
+
+### Switch regression of the 20:02 build (Switch log fnc-nx_008.log) and the rollback
+- On the console the `Resolve()` build was much worse: a ~1 minute fight load, black cutscenes, glitching fighters,
+  slower frames. The log: `uam 139 compiles (avg 972 ms)` of run-time shader variants (was 35 in fnc-nx_007), windows
+  of 0.05-2.8 fps while they compiled. Cause: `Resolve()` with both masters on (their default) switched on every
+  SA2 renderer enhancement gated by `banjo::EnhancementActive` (depth-only draws, output trim, early-Z, bool spec, ...)
+  and 22 SA2 `kExternal` keys, none proven on FNC/deko3d; the PC run could not show it (no deko3d, no uam).
+- Fix: `fnc_app.h` sets `sa2_cpu_enhancements`, `sa2_noncpu_enhancements` and `banjo_renut_store_cards` to false
+  unless the configuration sets them (the SD toml states them too). That is the enhancement state of every earlier
+  build. The shadow fix (`textures.cpp`) does not depend on them: PC run fnc-nx_075 with them off renders the fight,
+  shorts and crowd correctly with no shadow boxes (its fight diverged from the reference's timeline, so no MAD).
+- Each enhancement must now be turned on singly and proven on the console before it stays on.
+
+## Performance round (2026-11-21, night) and the console test set
+
+Switch run fnc-nx_009 (masters off, shadows fixed): fights 12-18 fps; game thread 44-71 ms, render thread 21-33 ms, GPU
+25-27 ms at the stock handheld clocks (CPU 1020 / GPU 307.2 / memory 1331.2 MHz), 3 cores, ~305 % of 300 % busy.
+The fighters flicker (heads, arms) since the shadows work.
+
+### Done
+- **GPU clock** (`fnc_gpu_boost`, default on): Horizon's official handheld 0x92220008 (GPU 460.8) through the SDK's
+  checked `switch_apm` path; **`fnc_ram_1600`** (default on) prefers its sibling 0x92220007 (GPU 460.8 + memory 1600,
+  also official): `RexSwitchApmPreferRam1600`. The result is in `logs/rex/rex_stderr.log` (`[apm] ...`).
+- **Hot-function order that applies**: `app/hot_functions.ld` was SA2's list (none of its functions exist in FNC), and
+  `tools/hot_order.py` named `.text.sub_X` where GCC puts a recompiled body in `.text.__imp__sub_X` (sub_X is a weak
+  alias): no game function was ever moved, in SA2 either. Fixed; regenerated from fnc-nx_009 (symbolised with a
+  rebuild of that NRO: 44 bytes differ, build IDs and a timestamp). The hottest game functions are now in the first
+  ~400 KB of .text. `build_switch.ps1` keeps every ELF as `out/nx/elf/<NRO sha256[:16]>.elf` for later profiles.
+- **Heap first-fit hints** (`heap_alloc_hint`, default on; `sdk/src/system/xmemory.cpp`): per heap, the lowest page
+  that may be free and the highest; `AllocRange` starts its scan there (Release/Reset/Restore/Initialize move them
+  back), so it returns the same address as the full scan. PC fnc-nx_081 with `heap_alloc_hint_verify=true`: 2,048+
+  allocations through boot, menus and a fight, 0 differences. Kept outside the class: xmemory.h unchanged.
+- **Ruled out: depth bias.** The renderer stores SetRenderState 51/52 but never applies a host bias; a PC fight
+  (fnc-nx_079, diagnostic since removed) showed FNC never sets a non-zero one.
+
+### On the SD card for the next console run (toml only, no code)
+- `banjo_deko3d_depth24 = false`, `banjo_deko3d_depth_handover = false`: the PC's depth path (32-bit float targets,
+  every depth resolve drawn). The flicker is console-only; on the console the 1280x720 scene depth (whose stencil the
+  shadow pass reads) was 24-bit unorm. If the flicker is gone, turn one back on at a time.
+- `banjo_renut_store_cards = true` + `banjo_renut_store_cards_verify = true`: same pixels as off (everything is still
+  hashed), and `[cards] ... changed under clean cards` lines say whether the cards hold on the console. None -> verify
+  off next: XXH3 was ~25-35 % of the render thread's fight samples in fnc-nx_009.
+
+### Profile of fnc-nx_009 (fight intervals, symbolised)
+- Loading into the fight: `renut::gpu::ReadbackResolvedTextureLocked` ~78 % of the render thread (the gear
+  compositor's synchronous GPU->CPU readbacks, commit 136a4bc). During the fight: XXH3 hashing on the render thread;
+  `BaseHeap::AllocRange` 9.5 % of FGGameSim (a page-by-page first-fit scan); game code `sub_8283B828` (cloth),
+  `sub_826D8178`, `sub_82A8F798`, `sub_82E4CC40`, `sub_82789120`, `sub_82A8B590`; `ExpandElementNormalized` (vertex
+  expansion, render thread).
+
+### Open
+- PC only, intermittent (2 of the last 5 runs, never before nor on the console): `[FATAL] Call to invalid or
+  unregistered function at guest address 0x00000000` on the audio thread ~2-3 s after start, right after the game
+  opens `sound_crowds.big` / `sound_fesfx.big`. The audio system checks the callback address, so a null pointer
+  inside the game's own callback: a start-up race in the sound engine that the renderer's timing exposes.
+
+## Console run `fnc-nx_010` diagnosis, flicker fixes, CPU/NEON speedups (`2026-11-22`)
+
+- **Log & profile findings (`E:\switch\fnc-nx\logs\fnc-nx_010.log`, `rex\rex_profile.log`)**:
+  - Fight ran at 11.9–14.7 fps (`game thread` 59–75 ms, `render thread` 23.8–28.0 ms, `GPU` 14.6–20.7 ms; avg 13.67 fps across 152 fight blocks, CPU 304.8% at 1020 MHz CPU / 460.8 MHz GPU / 1600 MHz RAM).
+  - Turning off `banjo_deko3d_depth24` and `banjo_deko3d_depth_handover` did not stop the console flicker; `store_cards_verify` reported `0` changed pages across the fight.
+  - Because `app/src/fnc/fnc_app.h` forced `sa2_cpu_enhancements = false` alongside `sa2_noncpu_enhancements = false`, all CPU enhancements and `banjo_renut_store_cards` were disabled by default, leaving XXH3 hashing (`21.9%` of the render thread), scalar `ExpandElementNormalized` (`17.4%`), `ConvertVertices` (`9.2%`), and heavy un-hooked guest loops active.
+- **Flicker & hazard fixes**:
+  - `app/src/renut_engine/gpu/render/textures.h`, `textures.cpp`, `surfaces.cpp`: unified transitions into `TransitionRenderTextureLocked` and added `IsCopyOrResolveLayout` (`COPY_SOURCE`, `COPY_DEST`, `RESOLVE_SOURCE`, `RESOLVE_DEST`) checked on **both** current and target layouts so transitions out of copy/resolve layouts always emit `RenderBarrierStage::COPY` (`DkBarrier_Full`) instead of fragment-only barriers and are never skipped by `banjo_deko3d_barrier_lean`.
+  - `app/thirdparty/plume/plume_deko3d_commands.cpp`: added missing `{}` around the `if` body in `invalidateZcullAfterCopy`.
+  - `app/src/renut_engine/gpu/render/draw.cpp`:
+    - Added `IsHandoverTarget` checking `g_handover_targets->depth` and all `colors[0..color_count-1]` in `FillTextures` memo invalidation.
+    - Added `color_count` / `colors` comparison to `TexturesReuse` (`sa2_renut_chain_reuse`).
+    - Added `depth_control_bits` (`DepthControl & 0x7u`) comparison to `TargetsReuse` to match `GatherTargets`' smaller-depth drop condition.
+    - Added `SHADER_READ` transition for `dest->words.get()` at the end of `ResolveDepth`.
+  - `app/src/fnc/fnc_app.h`: defaulted `sa2_cpu_enhancements = true` and `banjo_renut_store_cards = true`, while keeping `sa2_noncpu_enhancements = false`, `banjo_deko3d_zcull = false`, and `banjo_deko3d_depth_compression = false`.
+- **CPU & Render-Thread Speedups**:
+  - `sdk/src/system/util/object_table.cpp`: updated `ObjectTable::FindFreeSlot` to advance `last_free_entry_` past allocated slots (skipping slot 0) and updated `RemoveHandle`/`PurgeAllObjects` so handle creation avoids repeated O(n) linear scans.
+  - `app/src/renut_engine/gpu/render/vertex_format.cpp`: vectorized `ExpandElementNormalized<kEndian, kSigned, false>` on AArch64 (`NeonExpandPackedNormalized`) across `k8_8_8_8`, `k2_10_10_10`, `k10_11_11`, `k11_11_10`, `k16_16`, and `k16_16_16_16` including arbitrary swizzle permutations.
+  - `app/src/fnc/fnc_hot_guest.cpp`: added native/localized replacements for `sub_8283B828` (lock-free job queue tag-min search, `SA2_HOT_HOOK_COPY` with a 12-case deterministic self-test against `__imp__sub_8283B828`), `sub_826D6D18` (register-localized quad packer with bit-exact pack helpers, `Cmp::kAll`), `sub_82789120` (barrier-free SIMD skinning loop, `Cmp::kAll`), and `sub_82A87020` (barrier-free audio mix/resample loop, `Cmp::kAll`); switched concurrent `sub_8229B520` (`memcpy`) to `SA2_HOT_HOOK_COPY` after observing worker-thread buffer mutation during `Check()`.
+  - Re-ran `python tools/direct_calls.py --redo` (`0` remaining `__imp__sub_*` direct calls for all 7 hooks) and rebuilt `app/hot_functions.ld` via `tools/hot_order.py` from `fnc-nx_010`'s `rex_profile.log`.
+- **Verification & Deployment**:
+  - PC verify Fight Now (`verify_fix2`, `out\pc-renut\logs\fnc-nx_090.log`): `sub_8283B828` self-test `12/12 passed`, `9,784,727` guarded hook checks (`>4096` each on `sub_82A8B590`, `sub_82789120`, `sub_82A87020`, `>1,048,576` each on `sub_826D6D18`, `sub_82A8C308`) with `0` differences, `0` flush/codegen self-check mismatches, `91,810` `snapshot_deltas` checks (`0` differ), `99,240` vertex/index + `68,096` texture card checks (`0` changed), `0` `chain_reuse_verify` diffs, and clean fight frames (`verify_f0/29/59.png` from `verify_fix`).
+  - Clean PC Fight Now (`clean_fix`, `out\pc-renut\logs\fnc-nx_091.log`): locked `30.00 fps` with `3.47 ms` render-thread frame time.
+  - Switch release build (`out\nx\sa2.nro`, `57,139,719` bytes, SHA-256 `6A009E98C08155FF90B2E163392DCF69A310522735437E3638D17BE9EF136071`, ELF `out\nx\elf\6a009e98c08155ff.elf`): `tools/check_switch_build.py --classic` passed all checks; `nm` confirmed all 7 hook symbols override `__imp__sub_*` near the front of `.text`. Deployed to `E:\switch\fnc-nx\fnc-nx.nro` (SHA-256 verified) with `fnc-nx.toml` tuned for Switch (`deko3d_shaders.bin` preserved).

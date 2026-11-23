@@ -22,6 +22,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -1493,11 +1494,31 @@ BANJO_RENUT_HOOK(sub_8254ECF8, IsFencePending_hook);  // D3DDevice_IsFencePendin
 REX_EXTERN(__imp__sub_82CE4958);  // Direct3D_CreateDevice, the original
 REX_EXTERN(__imp__sub_82CF4E60);  // D3D::InitializePresentationParameters (CDevice*, D3DPRESENT_PARAMETERS*)
 REX_EXTERN(__imp__sub_82CF4BF8);  // D3D::InitializeApiState (CDevice*)
+
+REXCVAR_DEFINE_BOOL(fnc_renut_async_wait, true, "Banjo/FNC",
+                    "FNC D3DDevice_AcquireAsyncResources (sub_82CE4A30): render thread waits for "
+                    "D3DDevice_ReleaseAsyncResources (sub_82CE4638) before drawing past the acquire point, "
+                    "matching Xbox 360 PM4_WAIT_REG_MEM so skinned fighter vertex buffers are never read half-written");
+
 namespace {
 
 // The swap's scratch word (SynchronizeToPresentationInterval): FNC's hardware init allocates a block for it at 10900
 // (SA2 11028, N&B 10900).
 constexpr u32 kFncDeviceOffsetSwapScratch = 10900;
+constexpr u32 kFncDeviceOffsetAsyncShutdown = 24204;
+constexpr u32 kFncDeviceOffsetAsyncMem = 24208;
+constexpr u32 kFncDeviceOffsetAsyncSlots = 24216;
+constexpr u32 kFncDeviceOffsetAsyncState = 24224;
+
+std::mutex g_fnc_async_mutex;
+std::condition_variable g_fnc_async_cv;
+u32 g_fnc_async_seq = 0;
+u32 g_fnc_async_mask = 0;
+u64 g_fnc_async_acquires = 0;
+u64 g_fnc_async_releases = 0;
+u64 g_fnc_async_acq_timeouts = 0;
+u64 g_fnc_async_rt_waits = 0;
+u64 g_fnc_async_rt_timeouts = 0;
 
 // HRESULT Direct3D_CreateDevice(UINT Adapter, D3DDEVTYPE DeviceType, void*, DWORD BehaviorFlags,
 //     D3DPRESENT_PARAMETERS*, IDirect3DDevice9 **ppReturnedDeviceInterface) [sub_82CE4958; N&B 0x8264DF28]
@@ -1516,13 +1537,17 @@ void FncCreateDevice(PPCContext &ctx, uint8_t *base) {
   if (!g_ring_data)
     g_ring_data = records::AllocPhysicalBlock(kRingDataSize);
   const u32 fence_va = records::AllocPhysicalBlock(0x80 + 0x20);
-  if (!g_ring_sink || !g_ring_data || !fence_va) {
+  const u32 async_mem_va = records::AllocPhysicalBlock(4096);
+  const u32 async_slots_va = records::AllocPhysicalBlock(512);
+  if (!g_ring_sink || !g_ring_data || !fence_va || !async_mem_va || !async_slots_va) {
     RGPU_ERROR("Direct3D_CreateDevice: guest allocation failed");
     ctx.r3.u64 = kE_OUTOFMEMORY;
     return;
   }
   std::memset(GuestPtr<u8>(g_ring_sink), 0, kRingSinkSize);
   std::memset(GuestPtr<u8>(fence_va), 0, 0x80 + 0x20);
+  std::memset(GuestPtr<u8>(async_mem_va), 0, 4096);
+  std::memset(GuestPtr<u8>(async_slots_va), 0, 512);
   // FNC's own no-hardware device.
   ctx.r4.u64 = kDeviceTypeNoHardware;
   __imp__sub_82CE4958(ctx, base);
@@ -1541,8 +1566,18 @@ void FncCreateDevice(PPCContext &ctx, uint8_t *base) {
   bytes[kDeviceOffsetFlags2] |= kDeviceFlagImmediateFences;
   WriteU32(bytes, kDeviceOffsetFenceCompletion, fence_va);
   WriteU32(bytes, kFncDeviceOffsetSwapScratch, fence_va + 0x80);
+  WriteU32(bytes, kFncDeviceOffsetAsyncShutdown, 0);
+  WriteU32(bytes, kFncDeviceOffsetAsyncMem, async_mem_va);
+  WriteU32(bytes, kFncDeviceOffsetAsyncSlots, async_slots_va);
+  WriteU32(bytes, kFncDeviceOffsetAsyncState, 0);
+  WriteU32(bytes, kFncDeviceOffsetAsyncState + 4, 0);
   native::RewindRing(d);
   if (title_device) {
+    {
+      std::lock_guard lk(g_fnc_async_mutex);
+      g_fnc_async_seq = 0;
+      g_fnc_async_mask = 0;
+    }
     RtlInitializeCriticalSection(device_va + kDeviceOffsetCriticalSection0);
     RtlInitializeCriticalSection(device_va + kDeviceOffsetCriticalSection1);
     if (const u32 global = LoadGuestU32(kVdGlobalDeviceImportSlot))
@@ -1572,6 +1607,131 @@ void FncCreateDevice(PPCContext &ctx, uint8_t *base) {
   }
   RGPU_INFO("Guest D3D device (type {}) created at {:#010x}", device_type, device_va);
   ctx.r3.u64 = 0;  // S_OK
+}
+
+// D3DDevice_AcquireAsyncResources (sub_82CE4A30): acquires one of 32 async lock slots before worker threads update
+// GPU-consumed memory (e.g. skinned fighter vertex buffers in sub_826CDA28) and inserts the render-thread wait matching
+// Xbox 360 PM4_WAIT_REG_MEM, eliminating both guest bit-63 busy-spin deadlocks and half-written skinning races.
+void FncAcquireAsyncResources(PPCContext &ctx, uint8_t * /*base*/) {
+  const u32 device_va = ctx.r3.u32;
+  const u32 num_read = ctx.r4.u32;
+  const u32 pp_read = ctx.r5.u32;
+  const u32 num_write = ctx.r6.u32;
+  const u32 pp_write = ctx.r7.u32;
+  const u32 flags = ctx.r8.u32;
+  if (!device_va) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+
+  u32 fence_tag = LoadGuestU32(device_va + d3d::kDeviceOffsetFenceTag);
+  auto pick_latest = [&](u32 pp_list, u32 count, u32 field_off) -> u32 {
+    if (!pp_list || !count)
+      return 0;
+    u32 best = 0;
+    for (u32 i = 0; i < count; ++i) {
+      const u32 res = LoadGuestU32(pp_list + i * 4u);
+      if (!res)
+        continue;
+      const u32 f = LoadGuestU32(res + field_off);
+      if (!best || (f && u32(fence_tag - f) < u32(fence_tag - best)))
+        best = f;
+    }
+    return best;
+  };
+
+  const u32 read_fence = pick_latest(pp_read, num_read, 8);
+  const u32 write_fence = pick_latest(pp_write, num_write, 12);
+  if (!(flags & 4u) && ((read_fence && read_fence == fence_tag) || (write_fence && write_fence == fence_tag))) {
+    KickOff_hook(device_va);
+    fence_tag = LoadGuestU32(device_va + d3d::kDeviceOffsetFenceTag);
+  }
+
+  u32 seq = 0;
+  u64 handle = 0;
+  {
+    std::unique_lock lk(g_fnc_async_mutex);
+    while ((g_fnc_async_mask & 0x80000000u) != 0) {
+      if (flags & 2u) {
+        ctx.r3.u64 = 0;
+        return;
+      }
+      if (!g_fnc_async_cv.wait_for(lk, std::chrono::milliseconds(150),
+                                   [] { return (g_fnc_async_mask & 0x80000000u) == 0; })) {
+        RGPU_WARN("[fnc async] acquire slot-32 timeout: seq={} mask={:#010x} numRead={} numWrite={} flags={:#x} "
+                  "acq={} rel={}",
+                  g_fnc_async_seq, g_fnc_async_mask, num_read, num_write, flags, g_fnc_async_acquires,
+                  g_fnc_async_releases);
+        g_fnc_async_mask &= ~0x80000000u;
+        ++g_fnc_async_acq_timeouts;
+        break;
+      }
+    }
+    g_fnc_async_mask = (g_fnc_async_mask << 1) | 1u;
+    seq = ++g_fnc_async_seq;
+    ++g_fnc_async_acquires;
+    if (u8 *bytes = GuestPtr<u8>(device_va)) {
+      WriteU32(bytes, kFncDeviceOffsetAsyncState, g_fnc_async_mask);
+      WriteU32(bytes, kFncDeviceOffsetAsyncState + 4, seq);
+    }
+    handle = (u64(seq) << 32) | u64(fence_tag);
+    if (const u32 slots_va = LoadGuestU32(device_va + kFncDeviceOffsetAsyncSlots)) {
+      if (auto *slot = GuestPtr<be_u32>(slots_va + (seq & 31u) * 16u)) {
+        slot[0] = read_fence;
+        slot[1] = write_fence;
+        slot[2] = u32(handle >> 32);
+        slot[3] = u32(handle);
+      }
+    }
+    if (g_fnc_async_acquires == 1) {
+      RGPU_INFO("[fnc async] D3DDevice_AcquireAsyncResources hook active (fnc_renut_async_wait={})",
+                REXCVAR_GET(fnc_renut_async_wait));
+    }
+  }
+
+  if (!(flags & 4u) && REXCVAR_GET(fnc_renut_async_wait)) {
+    render_thread::QueueUnlocked([seq]() {
+      std::unique_lock lk(g_fnc_async_mutex);
+      auto is_released = [seq]() {
+        const u32 diff = g_fnc_async_seq - seq;
+        return diff >= 32u || (g_fnc_async_mask & (1u << diff)) == 0;
+      };
+      if (is_released())
+        return;
+      render_thread::WaitScope wait_scope;
+      ++g_fnc_async_rt_waits;
+      if (!g_fnc_async_cv.wait_for(lk, std::chrono::milliseconds(200), is_released)) {
+        if (++g_fnc_async_rt_timeouts <= 20) {
+          RGPU_WARN("[fnc async] render-thread wait timeout: wait_seq={} cur_seq={} mask={:#010x} acq={} rel={} "
+                    "waits={} timeouts={}",
+                    seq, g_fnc_async_seq, g_fnc_async_mask, g_fnc_async_acquires, g_fnc_async_releases,
+                    g_fnc_async_rt_waits, g_fnc_async_rt_timeouts);
+        }
+      }
+    });
+  }
+  ctx.r3.u64 = handle;
+}
+
+// D3DDevice_ReleaseAsyncResources (sub_82CE4638): clears the async slot and wakes waiting render/acquire threads.
+void FncReleaseAsyncResources(PPCContext &ctx, uint8_t * /*base*/) {
+  const u32 device_va = ctx.r3.u32;
+  const u64 handle = ctx.r4.u64;
+  const u32 handle_seq = u32(handle >> 32);
+  {
+    std::lock_guard lk(g_fnc_async_mutex);
+    const u32 diff = g_fnc_async_seq - handle_seq;
+    if (diff < 32u)
+      g_fnc_async_mask &= ~(1u << diff);
+    ++g_fnc_async_releases;
+    if (device_va) {
+      if (u8 *bytes = GuestPtr<u8>(device_va)) {
+        WriteU32(bytes, kFncDeviceOffsetAsyncState, g_fnc_async_mask);
+        WriteU32(bytes, kFncDeviceOffsetAsyncState + 4, g_fnc_async_seq);
+      }
+    }
+  }
+  g_fnc_async_cv.notify_all();
 }
 
 // FNC's ring segment allocator (sub_82CE2C78 (CDevice*, DWORD Count): BeginRingBig and KickOffSegment call it for a new
@@ -1606,6 +1766,12 @@ void FncSynchronizeToPresentationInterval_hook(u32 device_va, u32 /*immediate*/)
 
 BANJO_RENUT_HOOK_RAW(sub_82CE4958) {  // Direct3D_CreateDevice [0x8264DF28]
   FncCreateDevice(ctx, base);
+}
+BANJO_RENUT_HOOK_RAW(sub_82CE4A30) {  // D3DDevice_AcquireAsyncResources
+  FncAcquireAsyncResources(ctx, base);
+}
+BANJO_RENUT_HOOK_RAW(sub_82CE4638) {  // D3DDevice_ReleaseAsyncResources
+  FncReleaseAsyncResources(ctx, base);
 }
 BANJO_RENUT_HOOK(sub_82CE3C78, D3DDevice_InsertCallback_hook);  // D3DDevice_InsertCallback [0x821FB688]
 BANJO_RENUT_HOOK(sub_82CEB578, FncSynchronizeToPresentationInterval_hook);  // SynchronizeToPresentationInterval [0x8228A748]

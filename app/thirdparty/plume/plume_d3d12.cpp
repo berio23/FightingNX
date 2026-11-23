@@ -122,8 +122,17 @@ namespace plume {
             return DXGI_FORMAT_R8G8B8A8_SNORM;
         case RenderFormat::R8G8B8A8_SINT:
             return DXGI_FORMAT_R8G8B8A8_SINT;
+        case RenderFormat::R8G8B8A8_USCALED:
+        case RenderFormat::R8G8B8A8_SSCALED:
+            return DXGI_FORMAT_UNKNOWN;
         case RenderFormat::B8G8R8A8_UNORM:
             return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case RenderFormat::R10G10B10A2_UNORM:
+            return DXGI_FORMAT_R10G10B10A2_UNORM;
+        case RenderFormat::R10G10B10A2_SNORM:
+        case RenderFormat::B10G10R10A2_UNORM:
+        case RenderFormat::B10G10R10A2_SNORM:
+            return DXGI_FORMAT_UNKNOWN;
         case RenderFormat::R16G16_TYPELESS:
             return DXGI_FORMAT_R16G16_TYPELESS;
         case RenderFormat::R16G16_FLOAT:
@@ -146,6 +155,8 @@ namespace plume {
             return DXGI_FORMAT_R32G8X24_TYPELESS;
         case RenderFormat::D24_UNORM_S8_UINT:  // banjo-nx (2026-10-19): typeless, as above
             return DXGI_FORMAT_R24G8_TYPELESS;
+        case RenderFormat::S8_UINT:
+            return DXGI_FORMAT_R8_UINT;
         case RenderFormat::R32_FLOAT:
             return DXGI_FORMAT_R32_FLOAT;
         case RenderFormat::R32_UINT:
@@ -245,6 +256,9 @@ namespace plume {
             // Specialize into depth view of depth-stencil texture.
             return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
         }
+        if (dxgiFormat == DXGI_FORMAT_R24G8_TYPELESS) {
+            return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        }
         return dxgiFormat;
     }
 
@@ -253,6 +267,9 @@ namespace plume {
         if (dxgiFormat == DXGI_FORMAT_R32G8X24_TYPELESS) {
             // Specialize into full depth-stencil view.
             return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        }
+        if (dxgiFormat == DXGI_FORMAT_R24G8_TYPELESS) {
+            return DXGI_FORMAT_D24_UNORM_S8_UINT;
         }
         return dxgiFormat;
     }
@@ -1137,16 +1154,23 @@ namespace plume {
                         }
                     }
                     else {
+                        const UINT planeSlice =
+                            (interfaceTextureView->format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT ||
+                             interfaceTextureView->format == DXGI_FORMAT_X24_TYPELESS_G8_UINT)
+                                ? 1
+                                : 0;
                         if (interfaceTextureView->arraySize > 1) {
                             srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
                             srvDesc.Texture2DArray.MipLevels = interfaceTextureView->mipLevels;
                             srvDesc.Texture2DArray.MostDetailedMip = interfaceTextureView->mipSlice;
                             srvDesc.Texture2DArray.FirstArraySlice = interfaceTextureView->arrayIndex;
                             srvDesc.Texture2DArray.ArraySize = interfaceTextureView->arraySize;
+                            srvDesc.Texture2DArray.PlaneSlice = planeSlice;
                         } else {
                             srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
                             srvDesc.Texture2D.MipLevels = interfaceTextureView->mipLevels;
                             srvDesc.Texture2D.MostDetailedMip = interfaceTextureView->mipSlice;
+                            srvDesc.Texture2D.PlaneSlice = planeSlice;
                         }
                     }
 
@@ -2844,6 +2868,13 @@ namespace plume {
         this->arraySize = std::min(desc.arraySize, texture->desc.arraySize - desc.arrayIndex);
         this->arrayIndex = desc.arrayIndex;
         this->shader4ComponentMapping = toD3D12(desc.componentMapping);
+        if (desc.format == RenderFormat::S8_UINT && (texture->desc.flags & RenderTextureFlag::DEPTH_TARGET) &&
+            texture->desc.format != RenderFormat::S8_UINT && RenderFormatIsStencil(texture->desc.format)) {
+            this->format = (texture->desc.format == RenderFormat::D24_UNORM_S8_UINT)
+                               ? DXGI_FORMAT_X24_TYPELESS_G8_UINT
+                               : DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+            this->shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(1, 1, 1, 1);
+        }
     }
 
     D3D12TextureView::~D3D12TextureView() { }

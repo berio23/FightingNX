@@ -35,6 +35,9 @@ void RenutLockstepFrame(uint64_t game_frame, const rex::ui::RawImage* image);
 // Stops it (writes what it has, if anything).
 void Stop();
 
+// True while Start / StartWithSource has launched the recorder thread and it has not finished writing yet.
+bool IsActive();
+
 // Called by the flip hook before the game flips: with sa2_video_lockstep and a recording in progress, waits until the
 // recorder has taken the previous frame.
 void BeforeFlip();

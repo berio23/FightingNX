@@ -54,10 +54,19 @@ REXCVAR_DEFINE_INT32(sa2_diag_swap_hold_every_s, 0, "SA2/Diagnostics",
 
 // The native renderer's relaxed vsync key (src/me/me_native_system.cpp), the player's setting.
 extern ::sa2::enh::Enhancement g_vsync_relaxed;
+REXCVAR_DECLARE(bool, sa2_vsync_relaxed);
 
 namespace sa2::renut {
 
 namespace {
+
+inline bool RelaxedVsyncOn() {
+#if RENUT_GAME_FNC
+  return g_vsync_relaxed.active || REXCVAR_GET(sa2_vsync_relaxed);
+#else
+  return g_vsync_relaxed.active;
+#endif
+}
 
 using Clock = std::chrono::steady_clock;
 #if RENUT_GAME_FNC
@@ -188,7 +197,7 @@ void PaceSwap(uint32_t device_va) {
   // this clock's 60 Hz grid, which drifts against the display's. A late frame goes at once (as relaxed vsync); fixed
   // vsync (sa2_vsync_relaxed off) and an unknown refresh (the PC, the first frames) keep the grid below.
   ::banjo::display_sync::Start();
-  if (g_started && refreshes && g_vsync_relaxed.active) {
+  if (g_started && refreshes && RelaxedVsyncOn()) {
     const auto period = kRefresh * refreshes;
     const uint64_t now_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
     const uint64_t period_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(period).count());
@@ -227,7 +236,7 @@ void PaceSwap(uint32_t device_va) {
     NoteRelease(now, Clock::now(), false);
     return;
   }
-  if (g_vsync_relaxed.active) {
+  if (RelaxedVsyncOn()) {
     // Late: at once. A little late (under half a refresh: the host's scheduling), the grid is kept; more, the next
     // frame is due a period after this one.
     g_due = now - g_due < kRefresh / 2 ? g_due + period : now + period;

@@ -378,6 +378,8 @@ int main(int argc, char** argv)
         f.println("#include \"shader_cache.h\"");
 #endif
         f.println("ShaderCacheEntry g_shaderCacheEntries[] = {{");
+        if (shaders.empty())
+            f.println("\t{{}},");
 
         std::vector<uint8_t> dxil;
         std::vector<uint8_t> spirv;

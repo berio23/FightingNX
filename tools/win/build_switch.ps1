@@ -16,7 +16,8 @@ param(
     [switch]$Reconfigure,
     [ValidateSet('', 'none', 'generate', 'use')][string]$Pgo = '',
     [switch]$NoNvk,
-    [switch]$ReleaseShaders
+    [switch]$ReleaseShaders,
+    [string]$BuildDir
 )
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 . (Join-Path $PSScriptRoot 'env.ps1')  # VS CMake and Ninja on PATH (the compilers come from the toolchain file)
@@ -24,10 +25,11 @@ $nvk = if ($env:NVK_SDK) { $env:NVK_SDK } else {
     'C:/devkitPro/mesa-switch-main-nfsmw-source/mesa-switch-main/mesa-unified-install/opt/devkitpro/portlibs/switch' }
 # devkitPro's installer exports DEVKITPRO as an MSYS path (/opt/devkitpro) that Windows CMake cannot open.
 $devkitpro = if ($env:DEVKITPRO -and (Test-Path $env:DEVKITPRO)) { $env:DEVKITPRO } else { 'C:/devkitPro' }
-$build = Join-Path $root 'out\nx'
+$build = if ($BuildDir) { $BuildDir } else { Join-Path $root 'out\nx' }
 $glslang = Join-Path $root 'out\glslang\StandAlone\glslangValidator.exe'  # host tool: SPIR-V is portable
 if ($Reconfigure -or -not (Test-Path (Join-Path $build 'CMakeCache.txt'))) {
     & cmake -S (Join-Path $root 'app') -B $build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 `
         "-DCMAKE_TOOLCHAIN_FILE=$root\tools\switch\cmake\switch-devkitA64.cmake" `
         "-DREXGLUE_SWITCH_NVK_SDK=$nvk" "-DSA2_GLSLANG_VALIDATOR=$glslang" "-DDEVKITPRO=$devkitpro" `
         "-DCMAKE_MAKE_PROGRAM=$((Get-Command ninja).Source)" `
@@ -60,4 +62,16 @@ $pgoArgs += @("-DSA2_RENUT_RENDERER=ON", "-DREXGLUE_SWITCH_NO_NVK=$(if ($NoNvk) 
 & cmake $build "-DSA2_SWITCH_LTO_JOBS=$LtoJobs" @pgoArgs | Out-Null
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 & cmake --build $build -j $Jobs
-exit $LASTEXITCODE
+$code = $LASTEXITCODE
+# fnc-nx (2026-11-21): keep each build's ELF under the NRO's SHA-256 (out\nx\elf\<first 16 hex>.elf), so a console
+# profile (logs/rex/rex_profile.log, offsets into the NRO) can be symbolised later (tools/hot_order.py).
+$nro = Join-Path $build "sa2.nro"
+$elf = Join-Path $build "sa2"
+if (-not $code -and (Test-Path $nro) -and (Test-Path $elf)) {
+    $sha = (Get-FileHash -Algorithm SHA256 $nro).Hash.Substring(0, 16).ToLower()
+    $dir = Join-Path $build "elf"
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    Copy-Item -Force $elf (Join-Path $dir "$sha.elf")
+    Write-Host "ELF kept as $dir\$sha.elf"
+}
+exit $code

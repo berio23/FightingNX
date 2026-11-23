@@ -6,7 +6,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 
+#include <rex/cvar.h>
+
+#include "renut_engine/gpu/backend/backend.h"
 #include "renut_engine/gpu/log.h"
 #include "renut_engine/gpu/banjo_renut_tuning.h"
 #include "shader_common.h"
@@ -14,6 +18,13 @@
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
+
+REXCVAR_DEFINE_BOOL(fnc_deko3d_vtx_10_10_10_2, true, "FNC/Renderer",
+                    "Pass 2_10_10_10 vertex attributes natively on deko3d (DkVtxAttribSize_10_10_10_2)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(fnc_deko3d_vtx_8_8_8_8_scaled, true, "FNC/Renderer",
+                    "Pass 8_8_8_8 integer vertex attributes natively on deko3d (DkVtxAttribType_Uscaled/Sscaled)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace renut::gpu {
 
@@ -142,7 +153,7 @@ bool UnswapHalves(DeclType &type, u32 components) {
 }
 
 // Host format when the swapped guest words can be read as-is.
-plume::RenderFormat PassthroughFormat(const DeclType &type, const FormatInfo &info) {
+plume::RenderFormat PassthroughFormat(const DeclType &type, const FormatInfo &info, u8 usage, u8 usage_index) {
   using F = plume::RenderFormat;
   const bool native = IsNativeSwizzle(type, info.components);
   switch (type.format) {
@@ -161,8 +172,12 @@ plume::RenderFormat PassthroughFormat(const DeclType &type, const FormatInfo &in
       return F::UNKNOWN;
     return type.is_signed ? F::R16G16B16A16_SNORM : F::R16G16B16A16_UNORM;
   case k8_8_8_8:
-    if (type.is_integer)
+    if (type.is_integer) {
+      static const bool passthrough_scaled = REXCVAR_GET(fnc_deko3d_vtx_8_8_8_8_scaled);
+      if (native && IsDeko3D() && passthrough_scaled)
+        return type.is_signed ? F::R8G8B8A8_SSCALED : F::R8G8B8A8_USCALED;
       return F::UNKNOWN;
+    }
     if (native)
       return type.is_signed ? F::R8G8B8A8_SNORM : F::R8G8B8A8_UNORM;
     // D3DCOLOR: ZYXW over the swapped word is exactly BGRA.
@@ -170,7 +185,23 @@ plume::RenderFormat PassthroughFormat(const DeclType &type, const FormatInfo &in
         type.swizzle[3] == 3)
       return F::B8G8R8A8_UNORM;
     return F::UNKNOWN;
-  default:  // 2_10_10_10 and 10/11-bit formats have no plume equivalent
+  case k2_10_10_10: {
+    static const bool passthrough_10_10_10_2 = REXCVAR_GET(fnc_deko3d_vtx_10_10_10_2);
+    if (type.is_integer || !IsDeko3D() || !passthrough_10_10_10_2)
+      return F::UNKNOWN;
+    if (native)
+      return type.is_signed ? F::R10G10B10A2_SNORM : F::R10G10B10A2_UNORM;
+    if (type.swizzle[0] == 2 && type.swizzle[1] == 1 && type.swizzle[2] == 0 && type.swizzle[3] == 3)
+      return type.is_signed ? F::B10G10R10A2_SNORM : F::B10G10R10A2_UNORM;
+    // All FNC VS reading NORMAL0/TANGENT0 ignore .w; allow constant 0/1 swizzle on w (e.g. 0125).
+    const bool ignore_w_normal_tangent = (usage == DeclUsage::Normal || usage == DeclUsage::Tangent) &&
+                                         usage_index == 0 && type.swizzle[0] == 0 && type.swizzle[1] == 1 &&
+                                         type.swizzle[2] == 2 && (type.swizzle[3] == 4 || type.swizzle[3] == 5);
+    if (ignore_w_normal_tangent)
+      return type.is_signed ? F::R10G10B10A2_SNORM : F::R10G10B10A2_UNORM;
+    return F::UNKNOWN;
+  }
+  default:  // 10/11-bit formats have no plume equivalent
     return F::UNKNOWN;
   }
 }
@@ -199,6 +230,10 @@ u32 LoadGuestWord(const u8 *p) {
 }
 
 float HalfToFloat(u16 h) {
+#if defined(__aarch64__)
+  const uint16x4_t v = vdup_n_u16(h);
+  return vgetq_lane_f32(vcvt_f32_f16(vreinterpret_f16_u16(v)), 0);
+#else
   const u32 sign = u32(h >> 15) << 31;
   const u32 exponent = (h >> 10) & 0x1F;
   const u32 mantissa = h & 0x3FF;
@@ -218,6 +253,24 @@ float HalfToFloat(u16 h) {
   float out;
   std::memcpy(&out, &bits, 4);
   return out;
+#endif
+}
+
+template <u32 kShift, u32 kBits, bool kSigned, bool kInteger>
+inline float DecodeComponentFast(u32 word) {
+  const u32 raw = kBits == 32 ? word : (word >> kShift) & ((1u << kBits) - 1u);
+  if constexpr (kSigned) {
+    const int32_t value = kBits == 32 ? int32_t(raw) : int32_t(raw << (32 - kBits)) >> (32 - kBits);
+    if constexpr (kInteger)
+      return float(value);
+    constexpr float kInvMax = 1.0f / (kBits == 32 ? 2147483647.0f : float((1u << (kBits - 1)) - 1u));
+    return std::max(float(value) * kInvMax, -1.0f);
+  } else {
+    if constexpr (kInteger)
+      return float(raw);
+    constexpr float kInvMax = 1.0f / (kBits == 32 ? 4294967295.0f : float((1u << kBits) - 1u));
+    return float(raw) * kInvMax;
+  }
 }
 
 float DecodeComponent(u32 word, u32 shift, u32 bits, const DeclType &type) {
@@ -243,11 +296,204 @@ void ExpandLoop(const u8 *src, u32 src_stride, u8 *dst, u32 dst_stride, u32 coun
   u8 pick[4];
   for (u32 i = 0; i < 4; ++i)
     pick[i] = swizzle[i] < 6 ? swizzle[i] : 4;  // 4: 0, 5: 1; the rest read 0
+  if (pick[0] == 0 && pick[1] == 1 && pick[2] == 2 && pick[3] == 3) {
+    for (u32 v = 0; v < count; ++v, src += src_stride, dst += dst_stride) {
+      float c[6] = {0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f};
+      decode(src, c);
+      std::memcpy(dst, c, 16);
+    }
+    return;
+  }
+  const u8 p0 = pick[0], p1 = pick[1], p2 = pick[2], p3 = pick[3];
   for (u32 v = 0; v < count; ++v, src += src_stride, dst += dst_stride) {
     float c[6] = {0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f};
     decode(src, c);
-    const float out[4] = {c[pick[0]], c[pick[1]], c[pick[2]], c[pick[3]]};
+    const float out[4] = {c[p0], c[p1], c[p2], c[p3]};
     std::memcpy(dst, out, sizeof(out));
+  }
+}
+
+#if defined(__aarch64__)
+template <bool kSigned, u32 kFillMode, typename LoadFn>
+void NeonExpandPackedNormalized(const u8 swizzle[4], const u8 *src, u32 src_stride, u8 *dst, u32 dst_stride,
+                                u32 count, const int32_t lshift_arr[4], const int32_t rshift_arr[4],
+                                const float inv_max_arr[4], LoadFn load_words) {
+  u8 pick[4];
+  for (u32 i = 0; i < 4; ++i)
+    pick[i] = swizzle[i] < 6 ? swizzle[i] : 4;
+  const bool identity = pick[0] == 0 && pick[1] == 1 && pick[2] == 2 && pick[3] == 3;
+  uint8_t tbl_bytes[16];
+  for (u32 i = 0; i < 4; ++i) {
+    const u8 s = pick[i] < 4 ? pick[i] : 0;
+    for (u32 b = 0; b < 4; ++b)
+      tbl_bytes[i * 4 + b] = u8(s * 4 + b);
+  }
+  const uint8x16_t tbl = vld1q_u8(tbl_bytes);
+  const uint32x4_t const_mask = {pick[0] >= 4 ? ~0u : 0u, pick[1] >= 4 ? ~0u : 0u,
+                                 pick[2] >= 4 ? ~0u : 0u, pick[3] >= 4 ? ~0u : 0u};
+  const float32x4_t const_vals = {pick[0] == 5 ? 1.0f : 0.0f, pick[1] == 5 ? 1.0f : 0.0f,
+                                  pick[2] == 5 ? 1.0f : 0.0f, pick[3] == 5 ? 1.0f : 0.0f};
+  const int32x4_t lshift = vld1q_s32(lshift_arr);
+  const int32x4_t rshift = vld1q_s32(rshift_arr);
+  const float32x4_t inv_max = vld1q_f32(inv_max_arr);
+  const float32x4_t minus_one = vdupq_n_f32(-1.0f);
+  const float32x4_t fill_z0w1 = {0.0f, 0.0f, 0.0f, 1.0f};
+  const uint32x4_t fill_mask = {0u, 0u, kFillMode == 2 ? ~0u : 0u, kFillMode >= 1 ? ~0u : 0u};
+
+  auto emit = [&](const uint32x4_t words, u8 *out_ptr) {
+    const uint32x4_t top = vshlq_u32(words, lshift);
+    float32x4_t f;
+    if constexpr (kSigned) {
+      const int32x4_t sval = vshlq_s32(vreinterpretq_s32_u32(top), rshift);
+      f = vmaxq_f32(vmulq_f32(vcvtq_f32_s32(sval), inv_max), minus_one);
+    } else {
+      const uint32x4_t uval = vshlq_u32(top, rshift);
+      f = vmulq_f32(vcvtq_f32_u32(uval), inv_max);
+    }
+    if constexpr (kFillMode > 0)
+      f = vbslq_f32(fill_mask, fill_z0w1, f);
+    if (!identity) {
+      const float32x4_t perm = vreinterpretq_f32_u8(vqtbl1q_u8(vreinterpretq_u8_f32(f), tbl));
+      f = vbslq_f32(const_mask, const_vals, perm);
+    }
+    float tmp[4];
+    vst1q_f32(tmp, f);
+    std::memcpy(out_ptr, tmp, sizeof(tmp));
+  };
+
+  for (u32 v = 0; v < count; ++v, src += src_stride, dst += dst_stride)
+    emit(load_words(src), dst);
+}
+#endif
+
+template <u32 kEndian, bool kSigned, bool kInteger>
+void ExpandElementNormalized(u32 format, const u8 swizzle[4], const u8 *src, u32 src_stride,
+                             u8 *dst, u32 dst_stride, u32 count) {
+#if defined(__aarch64__)
+  if constexpr (!kInteger) {
+    auto word1 = [](const u8 *p) { return vdupq_n_u32(LoadGuestWord<kEndian>(p)); };
+    auto word2 = [](const u8 *p) {
+      const u32 w0 = LoadGuestWord<kEndian>(p);
+      const u32 w1 = LoadGuestWord<kEndian>(p + 4);
+      const uint32_t arr[4] = {w0, w0, w1, w1};
+      return vld1q_u32(arr);
+    };
+    switch (format) {
+    case k8_8_8_8: {
+      static constexpr int32_t l[4] = {24, 16, 8, 0};
+      static constexpr int32_t r[4] = {-24, -24, -24, -24};
+      static constexpr float inv[4] = {
+          kSigned ? 1.0f / 127.0f : 1.0f / 255.0f, kSigned ? 1.0f / 127.0f : 1.0f / 255.0f,
+          kSigned ? 1.0f / 127.0f : 1.0f / 255.0f, kSigned ? 1.0f / 127.0f : 1.0f / 255.0f};
+      NeonExpandPackedNormalized<kSigned, 0>(swizzle, src, src_stride, dst, dst_stride, count, l, r, inv, word1);
+      return;
+    }
+    case k2_10_10_10: {
+      static constexpr int32_t l[4] = {22, 12, 2, 0};
+      static constexpr int32_t r[4] = {-22, -22, -22, -30};
+      static constexpr float inv[4] = {
+          kSigned ? 1.0f / 511.0f : 1.0f / 1023.0f, kSigned ? 1.0f / 511.0f : 1.0f / 1023.0f,
+          kSigned ? 1.0f / 511.0f : 1.0f / 1023.0f, kSigned ? 1.0f : 1.0f / 3.0f};
+      NeonExpandPackedNormalized<kSigned, 0>(swizzle, src, src_stride, dst, dst_stride, count, l, r, inv, word1);
+      return;
+    }
+    case k10_11_11: {
+      static constexpr int32_t l[4] = {21, 10, 0, 0};
+      static constexpr int32_t r[4] = {-21, -21, -22, 0};
+      static constexpr float inv[4] = {
+          kSigned ? 1.0f / 1023.0f : 1.0f / 2047.0f, kSigned ? 1.0f / 1023.0f : 1.0f / 2047.0f,
+          kSigned ? 1.0f / 511.0f : 1.0f / 1023.0f, 0.0f};
+      NeonExpandPackedNormalized<kSigned, 1>(swizzle, src, src_stride, dst, dst_stride, count, l, r, inv, word1);
+      return;
+    }
+    case k11_11_10: {
+      static constexpr int32_t l[4] = {22, 11, 0, 0};
+      static constexpr int32_t r[4] = {-22, -21, -21, 0};
+      static constexpr float inv[4] = {
+          kSigned ? 1.0f / 511.0f : 1.0f / 1023.0f, kSigned ? 1.0f / 1023.0f : 1.0f / 2047.0f,
+          kSigned ? 1.0f / 1023.0f : 1.0f / 2047.0f, 0.0f};
+      NeonExpandPackedNormalized<kSigned, 1>(swizzle, src, src_stride, dst, dst_stride, count, l, r, inv, word1);
+      return;
+    }
+    case k16_16: {
+      static constexpr int32_t l[4] = {16, 0, 0, 0};
+      static constexpr int32_t r[4] = {-16, -16, 0, 0};
+      static constexpr float inv[4] = {
+          kSigned ? 1.0f / 32767.0f : 1.0f / 65535.0f, kSigned ? 1.0f / 32767.0f : 1.0f / 65535.0f, 0.0f, 0.0f};
+      NeonExpandPackedNormalized<kSigned, 2>(swizzle, src, src_stride, dst, dst_stride, count, l, r, inv, word1);
+      return;
+    }
+    case k16_16_16_16: {
+      static constexpr int32_t l[4] = {16, 0, 16, 0};
+      static constexpr int32_t r[4] = {-16, -16, -16, -16};
+      static constexpr float inv[4] = {
+          kSigned ? 1.0f / 32767.0f : 1.0f / 65535.0f, kSigned ? 1.0f / 32767.0f : 1.0f / 65535.0f,
+          kSigned ? 1.0f / 32767.0f : 1.0f / 65535.0f, kSigned ? 1.0f / 32767.0f : 1.0f / 65535.0f};
+      NeonExpandPackedNormalized<kSigned, 0>(swizzle, src, src_stride, dst, dst_stride, count, l, r, inv, word2);
+      return;
+    }
+    default:
+      break;
+    }
+  }
+#endif
+  auto word = [](const u8 *p, u32 i) { return LoadGuestWord<kEndian>(p + i * 4); };
+  auto expand = [&](auto decode) {
+    ExpandLoop(src, src_stride, dst, dst_stride, count, swizzle, decode);
+  };
+  switch (format) {
+  case k8_8_8_8:
+    expand([&](const u8 *p, float c[6]) {
+      const u32 w = word(p, 0);
+      c[0] = DecodeComponentFast<0, 8, kSigned, kInteger>(w);
+      c[1] = DecodeComponentFast<8, 8, kSigned, kInteger>(w);
+      c[2] = DecodeComponentFast<16, 8, kSigned, kInteger>(w);
+      c[3] = DecodeComponentFast<24, 8, kSigned, kInteger>(w);
+    });
+    break;
+  case k2_10_10_10:
+    expand([&](const u8 *p, float c[6]) {
+      const u32 w = word(p, 0);
+      c[0] = DecodeComponentFast<0, 10, kSigned, kInteger>(w);
+      c[1] = DecodeComponentFast<10, 10, kSigned, kInteger>(w);
+      c[2] = DecodeComponentFast<20, 10, kSigned, kInteger>(w);
+      c[3] = DecodeComponentFast<30, 2, kSigned, kInteger>(w);
+    });
+    break;
+  case k10_11_11:
+    expand([&](const u8 *p, float c[6]) {
+      const u32 w = word(p, 0);
+      c[0] = DecodeComponentFast<0, 11, kSigned, kInteger>(w);
+      c[1] = DecodeComponentFast<11, 11, kSigned, kInteger>(w);
+      c[2] = DecodeComponentFast<22, 10, kSigned, kInteger>(w);
+    });
+    break;
+  case k11_11_10:
+    expand([&](const u8 *p, float c[6]) {
+      const u32 w = word(p, 0);
+      c[0] = DecodeComponentFast<0, 10, kSigned, kInteger>(w);
+      c[1] = DecodeComponentFast<10, 11, kSigned, kInteger>(w);
+      c[2] = DecodeComponentFast<21, 11, kSigned, kInteger>(w);
+    });
+    break;
+  case k16_16:
+    expand([&](const u8 *p, float c[6]) {
+      const u32 w = word(p, 0);
+      c[0] = DecodeComponentFast<0, 16, kSigned, kInteger>(w);
+      c[1] = DecodeComponentFast<16, 16, kSigned, kInteger>(w);
+    });
+    break;
+  case k16_16_16_16:
+    expand([&](const u8 *p, float c[6]) {
+      const u32 w0 = word(p, 0), w1 = word(p, 1);
+      c[0] = DecodeComponentFast<0, 16, kSigned, kInteger>(w0);
+      c[1] = DecodeComponentFast<16, 16, kSigned, kInteger>(w0);
+      c[2] = DecodeComponentFast<0, 16, kSigned, kInteger>(w1);
+      c[3] = DecodeComponentFast<16, 16, kSigned, kInteger>(w1);
+    });
+    break;
+  default:
+    break;
   }
 }
 
@@ -266,67 +512,49 @@ void ExpandElement(const HostVertexElement &e, const u8 *src, u32 src_stride, u8
   };
   switch (type.format) {
   case k8_8_8_8:
-    expand([&](const u8 *p, float c[6]) {
-      const u32 w = word(p, 0);
-      for (u32 i = 0; i < 4; ++i)
-        c[i] = DecodeComponent(w, i * 8, 8, type);
-    });
-    break;
   case k2_10_10_10:
-    expand([&](const u8 *p, float c[6]) {
-      const u32 w = word(p, 0);
-      c[0] = DecodeComponent(w, 0, 10, type);
-      c[1] = DecodeComponent(w, 10, 10, type);
-      c[2] = DecodeComponent(w, 20, 10, type);
-      c[3] = DecodeComponent(w, 30, 2, type);
-    });
-    break;
   case k10_11_11:
-    expand([&](const u8 *p, float c[6]) {
-      const u32 w = word(p, 0);
-      c[0] = DecodeComponent(w, 0, 11, type);
-      c[1] = DecodeComponent(w, 11, 11, type);
-      c[2] = DecodeComponent(w, 22, 10, type);
-    });
-    break;
   case k11_11_10:
-    expand([&](const u8 *p, float c[6]) {
-      const u32 w = word(p, 0);
-      c[0] = DecodeComponent(w, 0, 10, type);
-      c[1] = DecodeComponent(w, 10, 11, type);
-      c[2] = DecodeComponent(w, 21, 11, type);
-    });
-    break;
   case k16_16:
-    expand([&](const u8 *p, float c[6]) {
-      const u32 w = word(p, 0);
-      c[0] = DecodeComponent(w, 0, 16, type);
-      c[1] = DecodeComponent(w, 16, 16, type);
-    });
-    break;
   case k16_16_16_16:
-    expand([&](const u8 *p, float c[6]) {
-      const u32 w0 = word(p, 0), w1 = word(p, 1);
-      c[0] = DecodeComponent(w0, 0, 16, type);
-      c[1] = DecodeComponent(w0, 16, 16, type);
-      c[2] = DecodeComponent(w1, 0, 16, type);
-      c[3] = DecodeComponent(w1, 16, 16, type);
-    });
+    if (type.is_signed) {
+      if (type.is_integer)
+        ExpandElementNormalized<kEndian, true, true>(type.format, type.swizzle, src, src_stride, dst, dst_stride, count);
+      else
+        ExpandElementNormalized<kEndian, true, false>(type.format, type.swizzle, src, src_stride, dst, dst_stride, count);
+    } else {
+      if (type.is_integer)
+        ExpandElementNormalized<kEndian, false, true>(type.format, type.swizzle, src, src_stride, dst, dst_stride, count);
+      else
+        ExpandElementNormalized<kEndian, false, false>(type.format, type.swizzle, src, src_stride, dst, dst_stride, count);
+    }
     break;
   case k16_16_Float:
     expand([&](const u8 *p, float c[6]) {
       const u32 w = word(p, 0);
+#if defined(__aarch64__)
+      const uint32x2_t v32 = vdup_n_u32(w);
+      const float32x4_t f = vcvt_f32_f16(vreinterpret_f16_u32(v32));
+      vst1_f32(c, vget_low_f32(f));
+#else
       c[0] = HalfToFloat(u16(w));
       c[1] = HalfToFloat(u16(w >> 16));
+#endif
     });
     break;
   case k16_16_16_16_Float:
     expand([&](const u8 *p, float c[6]) {
       const u32 w0 = word(p, 0), w1 = word(p, 1);
+#if defined(__aarch64__)
+      const uint32_t pair[2] = {w0, w1};
+      const uint16x4_t h = vreinterpret_u16_u32(vld1_u32(pair));
+      vst1q_f32(c, vcvt_f32_f16(vreinterpret_f16_u16(h)));
+#else
       c[0] = HalfToFloat(u16(w0));
       c[1] = HalfToFloat(u16(w0 >> 16));
       c[2] = HalfToFloat(u16(w1));
       c[3] = HalfToFloat(u16(w1 >> 16));
+#endif
     });
     break;
   case k32:
@@ -434,7 +662,7 @@ HostVertexLayout BuildHostVertexLayout(const GuestVertexElement *elements, u32 c
     host.guest_offset = u16(element.Offset);
     DeclType copy_type = host.type;
     host.swap_halves = UnswapHalves(copy_type, info.components);
-    host.host_format = PassthroughFormat(copy_type, info);
+    host.host_format = PassthroughFormat(copy_type, info, host.usage, host.usage_index);
     if (host.host_format == plume::RenderFormat::UNKNOWN)
       host.swap_halves = false;
     if (host.host_format != plume::RenderFormat::UNKNOWN) {
@@ -446,6 +674,36 @@ HostVertexLayout BuildHostVertexLayout(const GuestVertexElement *elements, u32 c
       host.host_format = plume::RenderFormat::R32G32B32A32_FLOAT;
       host.host_size = 16;
       host.components = 4;
+      // Log each unique non-passthrough vertex format once per run for Switch conversion diagnosis.
+      const uint32_t vtx_key = u32(host.type.format) | (u32(host.type.is_signed) << 6) |
+                               (u32(host.type.is_integer) << 7) | (u32(host.type.swizzle[0]) << 8) |
+                               (u32(host.type.swizzle[1]) << 11) | (u32(host.type.swizzle[2]) << 14) |
+                               (u32(host.type.swizzle[3]) << 17) | (u32(host.usage) << 20) |
+                               (u32(host.usage_index) << 24);
+      static std::mutex s_expand_log_mutex;
+      static uint32_t s_seen_keys[64];
+      static uint32_t s_seen_count = 0;
+      bool log_now = false;
+      {
+        std::lock_guard<std::mutex> lock(s_expand_log_mutex);
+        bool found = false;
+        for (uint32_t k = 0; k < s_seen_count; ++k) {
+          if (s_seen_keys[k] == vtx_key) {
+            found = true;
+            break;
+          }
+        }
+        if (!found && s_seen_count < std::size(s_seen_keys)) {
+          s_seen_keys[s_seen_count++] = vtx_key;
+          log_now = true;
+        }
+      }
+      if (log_now) {
+        RGPU_INFO("[vtx expand] {}{} fmt={} signed={} int={} swz={}{}{}{}",
+                  UsageSemantic(host.usage), host.usage_index, host.type.format, host.type.is_signed ? 1 : 0,
+                  host.type.is_integer ? 1 : 0, host.type.swizzle[0], host.type.swizzle[1],
+                  host.type.swizzle[2], host.type.swizzle[3]);
+      }
     }
     layout.streams[stream].used = true;
     layout.used_mask |= 1u << stream;  // sa2-nx

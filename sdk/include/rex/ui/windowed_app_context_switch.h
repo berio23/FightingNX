@@ -17,6 +17,9 @@ namespace rex::ui {
 
 class WindowSwitch;
 
+// Optional callback queried before switch_auto_exit_s exits: while true, exit is delayed up to a capture grace window.
+void SetSwitchAutoExitBusyCheck(bool (*fn)());
+
 // The UI thread is the main thread. It sleeps until there is work: functions
 // posted from other threads, a paint request, an applet message (focus, HOME,
 // dock, exit request) or a change of the display resolution.
@@ -44,6 +47,8 @@ class SwitchWindowedAppContext final : public WindowedAppContext {
   // Called by the applet hook, on the UI thread, from inside appletMainLoop.
   void OnAppletHook(int hook_type);
 
+  bool AutoExitTriggered() const { return auto_exit_triggered_; }
+
  private:
   // Holds libnx types, which stay out of this header.
   struct Impl;
@@ -56,6 +61,7 @@ class SwitchWindowedAppContext final : public WindowedAppContext {
   bool display_changed_ = false;
   bool focus_changed_ = false;
   bool quit_requested_ = false;
+  bool auto_exit_triggered_ = false;
 };
 
 }  // namespace rex::ui

@@ -110,18 +110,20 @@ def build_index(gen):
     return out
 
 
-def native_hooks():
-    """Addresses of the natives of sa2_hot_guest.cpp: a native touches no more than its original. The localized copies
+def native_hooks(hooks_file=None, hot_dir=None):
+    """Addresses of the natives of the hot guest file: a native touches no more than its original. The localized copies
     (SA2_HOT_HOOK_COPY) count too: a copy leaves exactly the registers its original leaves. SA2_COPY_FOR_HOOK does not:
     those functions are also hooked by the renderer (src/me/sa2_me_hooks.cpp), which reads argument registers itself."""
-    text = open(os.path.join(ROOT, 'app', 'src', 'cpu', 'sa2_hot_guest.cpp'), encoding='utf-8').read()
+    hooks_file = hooks_file or os.path.join(ROOT, 'app', 'src', 'cpu', 'sa2_hot_guest.cpp')
+    hot_dir = hot_dir or os.path.join(ROOT, 'app', 'generated', 'hot')
+    text = open(hooks_file, encoding='utf-8').read()
     # sa2-nx (2026-10-28): and the bulk copies' hooks.
-    for inc in glob.glob(os.path.join(ROOT, 'app', 'generated', 'hot', 'localized_bulk_hooks_*.inc')):
+    for inc in glob.glob(os.path.join(hot_dir, 'localized_bulk_hooks_*.inc')):
         text += open(inc, encoding='utf-8').read()
     return set(re.findall(r'SA2_HOT_HOOK(?:_UNGUARDED|_COPY)?\(([0-9A-F]{8}),', text))
 
 
-def other_hooks():
+def other_hooks(hooks_file=None, hot_dir=None):
     """Every 82xxxxxx address the app or SDK sources' code mentions, minus the natives: an app hook may read any
     register. Comments and __imp__sub_X references are left out (2026-10-07, as in tools/direct_calls.py): a comment
     hooks nothing, and __imp__sub_X calls the original, which takes no register of the caller's copy."""
@@ -139,7 +141,7 @@ def other_hooks():
                 text = re.sub(r'//[^\n]*', ' ', text)
                 text = re.sub(r'__imp__sub_[0-9A-Fa-f]{8}', ' ', text)
                 names.update(m.upper() for m in re.findall(r'(?<![0-9A-Fa-f])(82[0-9A-Fa-f]{6})(?![0-9A-Fa-f])', text))
-    return names - native_hooks()
+    return names - native_hooks(hooks_file, hot_dir)
 
 
 class Reach:
@@ -284,20 +286,26 @@ def main():
     ap.add_argument('address', nargs='?')
     ap.add_argument('--what', default='')
     ap.add_argument('--gen', default=os.path.join(ROOT, 'app', 'generated', 'default'))
+    ap.add_argument('--hooks-file', default=os.path.join(ROOT, 'app', 'src', 'cpu', 'sa2_hot_guest.cpp'),
+                    help='file defining hand-written SA2_HOT_HOOK* natives')
+    ap.add_argument('--hot-dir', default=os.path.join(ROOT, 'app', 'generated', 'hot'),
+                    help='output folder for localized copy headers and bulk hook .inc files')
     ap.add_argument('--out')
     ap.add_argument('--allow-double', action='store_true')
     ap.add_argument('--sync', choices=('smart', 'full'), default='smart',
                     help='smart: each call syncs only what its callee can reach (default); full: every register')
     ap.add_argument('--list', help='file of "<address> <what>" lines (app/src/cpu/hot/localized.txt): localize them all '
-                                   'into app/generated/hot/')
-    ap.add_argument('--bulk', help='file of "<address> <what>" lines (app/src/cpu/hot/localized_bulk.txt): their copies '
-                                   'and their hooks (app/generated/hot/localized_bulk_hooks_<N>.inc)')
-    ap.add_argument('--shards', type=int, default=4, help='hook files for --bulk (src/cpu/sa2_hot_bulk_<N>.cpp each)')
+                                   'into --hot-dir')
+    ap.add_argument('--bulk', help='file of "<address> <what>" lines (localized_bulk.txt): their copies '
+                                   'and their hooks (--hot-dir/localized_bulk_hooks_<N>.inc)')
+    ap.add_argument('--shards', type=int, default=4, help='hook files for --bulk (sa2_hot_bulk_<N>.cpp each)')
     ap.add_argument('--writebacks', choices=('changed', 'all'), default='changed',
                     help='changed: each write-back stores only the registers that may differ (default); all: every one')
     a = ap.parse_args()
-    global WRITEBACKS
+    global WRITEBACKS, HOOKS_FILE, HOT_DIR
     WRITEBACKS = a.writebacks
+    HOOKS_FILE = os.path.abspath(a.hooks_file)
+    HOT_DIR = os.path.abspath(a.hot_dir)
     if a.list or a.bulk:
         if a.list:
             for line in open(a.list, encoding='utf-8'):
@@ -305,10 +313,10 @@ def main():
                 if not line or line.startswith('#'):
                     continue
                 addr, _, what = line.partition(' ')
-                localize(addr, what.strip(), a.gen, os.path.join(ROOT, 'app', 'generated', 'hot', f'n_{addr.upper()}.h'),
+                localize(addr, what.strip(), a.gen, os.path.join(HOT_DIR, f'n_{addr.upper()}.h'),
                          a.allow_double, a.sync)
         if a.bulk:
-            bulk(a.bulk, a.gen, a.shards, a.sync)
+            bulk(a.bulk, a.gen, a.shards, a.sync, hooks_file=HOOKS_FILE, hot_dir=HOT_DIR)
         return
     if not a.address:
         ap.error('an address or --list')
@@ -316,6 +324,8 @@ def main():
 
 
 WRITEBACKS = 'changed'
+HOOKS_FILE = os.path.join(ROOT, 'app', 'src', 'cpu', 'sa2_hot_guest.cpp')
+HOT_DIR = os.path.join(ROOT, 'app', 'generated', 'hot')
 
 
 def code_hashes(gen, addrs):
@@ -340,13 +350,14 @@ def code_hashes(gen, addrs):
     return out
 
 
-def bulk(path, gen, shards, sync):
+def bulk(path, gen, shards, sync, hooks_file=None, hot_dir=None):
     """The bulk list's copies and their hook files (localized_bulk_hooks_<N>.inc)."""
-    hot = os.path.join(ROOT, 'app', 'generated', 'hot')
+    hooks_file = hooks_file or HOOKS_FILE
+    hot = hot_dir or HOT_DIR
     # The hand-made hooks only (not the bulk files of an earlier run, which name this list's own functions).
     taken = set(re.findall(r'SA2_(?:HOT_HOOK(?:_UNGUARDED|_COPY)?|COPY_FOR_HOOK)\(([0-9A-F]{8}),',
-                           open(os.path.join(ROOT, 'app', 'src', 'cpu', 'sa2_hot_guest.cpp'), encoding='utf-8').read()))
-    mentioned = other_hooks()
+                           open(hooks_file, encoding='utf-8').read()))
+    mentioned = other_hooks(hooks_file, hot)
     entries, seen = [], set()
     for line in open(path, encoding='utf-8'):
         line = line.strip()
@@ -401,7 +412,7 @@ _REACH = {}
 
 def reach_for(gen):
     if gen not in _REACH:
-        _REACH[gen] = Reach(build_index(gen), other_hooks())
+        _REACH[gen] = Reach(build_index(gen), other_hooks(HOOKS_FILE, HOT_DIR))
     return _REACH[gen]
 
 

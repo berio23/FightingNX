@@ -70,6 +70,11 @@ std::atomic<bool> g_done{false};
  * unchanged RAM" pair, setting this to true takes the RAM 1600 one anyway.
  */
 std::atomic<bool> g_allow_ram_1600{false};
+/*
+ * fnc-nx (2026-11-21): try the RAM 1600 configuration of the requested GPU clock FIRST (0x92220007, Nintendo's
+ * official handheld GPU 460.8 + EMC 1600 profile), then the others. Implies g_allow_ram_1600.
+ */
+std::atomic<bool> g_prefer_ram_1600{false};
 
 /*
  * Watchdog state. g_emc_original is the memory clock the console had before we touched anything, in
@@ -213,6 +218,11 @@ extern "C" void RexSwitchApmAllowRam1600(int allow) {
   g_allow_ram_1600.store(allow != 0, std::memory_order_relaxed);
 }
 
+extern "C" void RexSwitchApmPreferRam1600(int prefer) {
+  g_prefer_ram_1600.store(prefer != 0, std::memory_order_relaxed);
+  if (prefer) g_allow_ram_1600.store(true, std::memory_order_relaxed);
+}
+
 extern "C" void RexSwitchApmApply(void) {
   const int mhz = g_request.load(std::memory_order_relaxed);
   if (mhz <= 0 || g_done.exchange(true)) {
@@ -249,9 +259,16 @@ extern "C" void RexSwitchApmApply(void) {
    * moving the memory is accepted. The check is the 1.5 s poll, not a single read: a read at 250 ms
    * once said the memory was still at 1331.2, and one second later it was at 1600.
    */
-  for (const Candidate& c : kCandidate) {
+  const bool prefer_1600 = g_prefer_ram_1600.load(std::memory_order_relaxed);
+  constexpr int kCount = int(sizeof(kCandidate) / sizeof(kCandidate[0]));
+  for (int pass = prefer_1600 ? 0 : 1; pass < 2; ++pass)
+  for (int ci = 0; ci < kCount; ++ci) {
+    const Candidate& c = kCandidate[ci];
     if (c.mhz != mhz) {
       continue;
+    }
+    if (prefer_1600 && (pass == 0) != (c.emc == 1600)) {
+      continue;  // pass 0: the RAM 1600 ones only; pass 1: the rest
     }
     if (R_FAILED(apmSetPerformanceConfiguration(mode, c.config))) {
       continue;  // that configuration does not exist on this firmware
@@ -350,6 +367,7 @@ extern "C" void RexSwitchApmWatch(void) {
 #else   // !REX_PLATFORM_SWITCH
 extern "C" void RexSwitchApmRequestGpuMhz(int) {}
 extern "C" void RexSwitchApmAllowRam1600(int) {}
+extern "C" void RexSwitchApmPreferRam1600(int) {}
 extern "C" void RexSwitchApmApply(void) {}
 extern "C" void RexSwitchApmWatch(void) {}
 #endif  // REX_PLATFORM_SWITCH

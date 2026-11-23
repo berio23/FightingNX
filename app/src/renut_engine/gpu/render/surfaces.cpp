@@ -542,7 +542,7 @@ uint32_t SurfaceSampleSlotLocked(HostSurface *surface) {
 // banjo-nx (2026-10-18): the bindless slot of a depth/stencil target's stencil view (read as uint by the depth
 // resolve), or kInvalidDescriptor (no stencil, D3D12, or no view). Tried once a surface.
 uint32_t SurfaceStencilSlotLocked(HostSurface *surface) {
-  if (!surface || !surface->texture || !UsesVulkanBindings() || !plume::RenderFormatIsStencil(surface->format))
+  if (!surface || !surface->texture || !plume::RenderFormatIsStencil(surface->format))
     return kInvalidDescriptor;
   if (surface->stencil_slot != UINT32_MAX)
     return surface->stencil_slot;
@@ -560,25 +560,9 @@ uint32_t SurfaceStencilSlotLocked(HostSurface *surface) {
 }
 
 void TransitionSurfaceLocked(HostSurface *surface, plume::RenderTextureLayout layout) {
-  if (!surface || !surface->texture || surface->layout == layout)
+  if (!surface)
     return;
-  // banjo-nx (2026-10-19, banjo_deko3d_barrier_lean): from one read layout to another: no barrier (textures.cpp).
-  if (IsDeko3D() && banjo::renut_gpu::Deko3DBarrierLeanOn() && ReadOnlyLayout(surface->layout) &&
-      ReadOnlyLayout(layout)) {
-    surface->layout = layout;
-    return;
-  }
-  plume::RenderCommandList *cmd = Video::CommandListLocked();
-  if (!cmd)
-    return;
-  cmd->barriers(layout == plume::RenderTextureLayout::COPY_SOURCE ||
-                        layout == plume::RenderTextureLayout::COPY_DEST ||
-                        layout == plume::RenderTextureLayout::RESOLVE_SOURCE ||
-                        layout == plume::RenderTextureLayout::RESOLVE_DEST
-                    ? plume::RenderBarrierStage::COPY
-                    : plume::RenderBarrierStage::GRAPHICS,
-                plume::RenderTextureBarrier(surface->texture.get(), layout));
-  surface->layout = layout;
+  TransitionRenderTextureLocked(surface->texture.get(), surface->layout, layout);
 }
 
 void SwapDepthImageLocked(HostSurface &surface, DepthImage &image) {
@@ -688,17 +672,7 @@ void RetireColourImageLocked(DepthImage &image) {
 }
 
 void TransitionDepthImageLocked(DepthImage &image, plume::RenderTextureLayout layout) {
-  if (!image.texture || image.layout == layout)
-    return;
-  if (IsDeko3D() && banjo::renut_gpu::Deko3DBarrierLeanOn() && ReadOnlyLayout(image.layout) && ReadOnlyLayout(layout)) {
-    image.layout = layout;
-    return;
-  }
-  plume::RenderCommandList *cmd = Video::CommandListLocked();
-  if (!cmd)
-    return;
-  cmd->barriers(plume::RenderBarrierStage::GRAPHICS, plume::RenderTextureBarrier(image.texture.get(), layout));
-  image.layout = layout;
+  TransitionRenderTextureLocked(image.texture.get(), image.layout, layout);
 }
 
 uint32_t DepthImageViewSlotLocked(plume::RenderTexture *texture, plume::RenderFormat format,

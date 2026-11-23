@@ -157,9 +157,15 @@ def main():
         run(tool('flush_hoist.py'), '--gen', game)
     if not scratch:
         # sa2-nx (2026-10-28): and the bulk copies with their hook files (src/cpu/sa2_hot_bulk_<N>.cpp compile them).
-        bulk = os.path.join(APP, 'src', 'cpu', 'hot', 'localized_bulk.txt')
-        run(tool('localize_native.py'), '--list', os.path.join(APP, 'src', 'cpu', 'hot', 'localized.txt'),
-            *(['--bulk', bulk] if os.path.exists(bulk) else []))
+        fnc_hooks = os.path.join(APP, 'src', 'fnc', 'fnc_hot_guest.cpp')
+        fnc_bulk = os.path.join(APP, 'src', 'fnc', 'hot', 'localized_bulk.txt')
+        if os.path.exists(fnc_hooks) and os.path.exists(fnc_bulk):
+            run(tool('localize_native.py'), '--list', os.path.join(APP, 'src', 'cpu', 'hot', 'localized.txt'),
+                '--hooks-file', fnc_hooks, '--bulk', fnc_bulk)
+        else:
+            bulk = os.path.join(APP, 'src', 'cpu', 'hot', 'localized_bulk.txt')
+            run(tool('localize_native.py'), '--list', os.path.join(APP, 'src', 'cpu', 'hot', 'localized.txt'),
+                *(['--bulk', bulk] if os.path.exists(bulk) else []))
     if optimised:
         game = os.path.join(gen, 'default')
         proofs = os.path.join(ROOT, 'out', 'codegen_proofs')

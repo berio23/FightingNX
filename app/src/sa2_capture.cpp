@@ -72,6 +72,7 @@ std::mutex g_mutex;
 std::condition_variable g_cv;
 bool g_stop = false;
 std::thread g_thread;
+std::atomic<bool> g_active{false};
 // sa2_video_lockstep: set while the recorder takes every frame; the game frame of the last frame it took.
 std::atomic<bool> g_lockstep{false};
 std::atomic<uint64_t> g_recorded{0};
@@ -158,6 +159,9 @@ void Resample(const rex::ui::RawImage& in, uint32_t width, uint32_t height, rex:
 
 void Record(std::function<bool(rex::ui::RawImage&)> grab, int start_s, int frame_count, bool allow_lockstep,
             bool renut) {
+  struct ActiveGuard {
+    ~ActiveGuard() { g_active.store(false, std::memory_order_release); }
+  } active_guard;
   {
     std::unique_lock lock(g_mutex);
     if (g_cv.wait_for(lock, std::chrono::seconds(start_s), [] { return g_stop; })) {
@@ -386,6 +390,7 @@ void Start(std::function<rex::ui::Presenter*()> get_presenter) {
     rex::ui::Presenter* presenter = get_presenter ? get_presenter() : nullptr;
     return presenter && presenter->CaptureGuestOutput(image);
   };
+  g_active.store(true, std::memory_order_release);
   g_thread = std::thread(Record, std::move(grab), int(REXCVAR_GET(sa2_video_s)), int(REXCVAR_GET(sa2_video_frames)),
                          true, false);
 }
@@ -398,9 +403,12 @@ void StartWithSource(std::function<bool(rex::ui::RawImage&)> grab) {
     std::lock_guard lock(g_mutex);
     g_stop = false;
   }
+  g_active.store(true, std::memory_order_release);
   g_thread = std::thread(Record, std::move(grab), int(REXCVAR_GET(sa2_video_s)), int(REXCVAR_GET(sa2_video_frames)),
                          false, true);
 }
+
+bool IsActive() { return g_active.load(std::memory_order_acquire); }
 
 bool RenutLockstepOn() { return g_renut_lockstep.load(std::memory_order_acquire); }
 

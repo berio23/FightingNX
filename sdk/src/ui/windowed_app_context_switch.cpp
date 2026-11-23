@@ -9,8 +9,11 @@
 #include <rex/ui/windowed_app_context_switch.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ui/window_switch.h>
 
@@ -25,6 +28,12 @@ namespace {
 // Every source of work signals an event, so this only bounds how long a
 // missed signal could go unnoticed.
 constexpr u64 kWaitTimeoutNs = 100'000'000;
+
+std::atomic<bool (*)()> g_auto_exit_busy_check{nullptr};
+
+REXCVAR_DEFINE_INT32(switch_auto_exit_s, 0, "Switch",
+                     "Exit cleanly to the Home Menu after N seconds (0 = off; waits for active video capture)")
+    .range(0, 86400);
 
 void AppletHookCallback(AppletHookType hook, void* param) {
   static_cast<SwitchWindowedAppContext*>(param)->OnAppletHook(int(hook));
@@ -99,6 +108,10 @@ bool SwitchWindowedAppContext::Initialize() {
   return true;
 }
 
+void SetSwitchAutoExitBusyCheck(bool (*fn)()) {
+  g_auto_exit_busy_check.store(fn, std::memory_order_release);
+}
+
 void SwitchWindowedAppContext::NotifyUILoopOfPendingFunctions() {
   ueventSignal(&impl_->wakeup);
 }
@@ -165,7 +178,24 @@ void SwitchWindowedAppContext::ProcessQuitRequest() {
 }
 
 int SwitchWindowedAppContext::RunMainMessageLoop() {
+  const auto loop_start = std::chrono::steady_clock::now();
   while (!HasQuitFromUIThread()) {
+    const int auto_exit_s = REXCVAR_GET(switch_auto_exit_s);
+    if (auto_exit_s > 0) {
+      const double elapsed =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - loop_start).count();
+      if (elapsed >= double(auto_exit_s)) {
+        auto check = g_auto_exit_busy_check.load(std::memory_order_acquire);
+        const bool busy = check && check();
+        constexpr double kCaptureGraceS = 45.0;
+        if (!busy || elapsed >= double(auto_exit_s) + kCaptureGraceS) {
+          REXLOG_INFO("Switch: switch_auto_exit_s ({} s) reached at {:.1f} s (capture_busy={}); exiting cleanly",
+                      auto_exit_s, elapsed, busy);
+          auto_exit_triggered_ = true;
+          break;
+        }
+      }
+    }
     s32 index = -1;
     if (impl_->has_display_resolution_event) {
       waitMulti(&index, kWaitTimeoutNs, waiterForUEvent(&impl_->wakeup),

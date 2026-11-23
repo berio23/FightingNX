@@ -157,8 +157,23 @@ std::pair<uint64_t, uint64_t> guest_tick_ratio_ = std::make_pair(1, 1);
 std::atomic<uint64_t> last_guest_tick_count_{0};
 // Last sampled host tick count.
 uint64_t last_host_tick_count_ = Clock::QueryHostTickCount();
-// Mutex to ensure last_host_tick_count_ and last_guest_tick_count_ are in sync
+// Mutex to ensure last_host_tick_count_, last_guest_tick_count_, and snapshot stay in sync on scalar/freq changes
 std::mutex tick_mutex_;
+
+// Lock-free seqlock snapshot for UpdateGuestClock(): avoids 480k/s cross-core mutex contention when 3 cores read time.
+struct ClockSnapshot {
+  std::atomic<uint32_t> seq{0};
+  uint64_t base_host = 0;
+  uint64_t base_guest = 0;
+  uint64_t num = 1;
+  uint64_t den = 1;
+};
+
+uint64_t ScaleDelta(uint64_t delta, uint64_t num, uint64_t den) {
+  return (delta / den) * num + ((delta % den) * num) / den;
+}
+
+ClockSnapshot g_clock_snap{0, last_host_tick_count_, 0, 1, 1};
 
 void RecomputeGuestTickScalar() {
   // Create a rational number with numerator (first) and denominator (second)
@@ -176,11 +191,23 @@ void RecomputeGuestTickScalar() {
   reduce_fraction(frac);
 
   std::lock_guard<std::mutex> lock(tick_mutex_);
+  const uint64_t now_host = Clock::QueryHostTickCount();
+  const uint64_t prev_delta = now_host > g_clock_snap.base_host ? now_host - g_clock_snap.base_host : 0;
+  const uint64_t now_guest = g_clock_snap.base_guest + ScaleDelta(prev_delta, g_clock_snap.num, g_clock_snap.den);
+  const uint32_t s = g_clock_snap.seq.load(std::memory_order_relaxed);
+  g_clock_snap.seq.store(s + 1, std::memory_order_release);
+  g_clock_snap.base_host = now_host;
+  g_clock_snap.base_guest = now_guest;
+  g_clock_snap.num = frac.first;
+  g_clock_snap.den = frac.second;
+  last_host_tick_count_ = now_host;
+  last_guest_tick_count_.store(now_guest, std::memory_order_release);
   guest_tick_ratio_ = frac;
+  g_clock_snap.seq.store(s + 2, std::memory_order_release);
 }
 
 // Update the guest timer for all threads.
-// Return a copy of the value so locking is reduced.
+// Return a copy of the value without mutex contention using the lock-free snapshot.
 uint64_t UpdateGuestClock() {
   uint64_t host_tick_count = Clock::QueryHostTickCount();
 
@@ -190,29 +217,35 @@ uint64_t UpdateGuestClock() {
   }
 
   REX_SYS_COUNT(rex::syscount::kClockCall, 1);
-  std::unique_lock<std::mutex> lock(tick_mutex_, std::defer_lock);
-  if (lock.try_lock()) {
-    // Translate host tick count to guest tick count.
-    uint64_t host_tick_delta =
-        host_tick_count > last_host_tick_count_ ? host_tick_count - last_host_tick_count_ : 0;
-    last_host_tick_count_ = host_tick_count;
-    uint64_t guest_tick_delta =
-        host_tick_delta * guest_tick_ratio_.first / guest_tick_ratio_.second;
-    const uint64_t guest_tick_count =
-        last_guest_tick_count_.load(std::memory_order_relaxed) + guest_tick_delta;
-    last_guest_tick_count_.store(guest_tick_count, std::memory_order_release);
-    return guest_tick_count;
-  } else {
-    REX_SYS_COUNT(rex::syscount::kClockBlocked, 1);
-    if (REXCVAR_GET(clock_nonblocking)) {
-      // Another thread is inside the update (a few instructions): its count is the one it is about to
-      // publish and that is what waiting for the lock used to return.
-      return last_guest_tick_count_.load(std::memory_order_acquire);
+  if (REXCVAR_GET(clock_nonblocking)) {
+    uint64_t base_host, base_guest, num, den;
+    for (;;) {
+      const uint32_t s1 = g_clock_snap.seq.load(std::memory_order_acquire);
+      if (s1 & 1u) {
+        continue;
+      }
+      base_host = g_clock_snap.base_host;
+      base_guest = g_clock_snap.base_guest;
+      num = g_clock_snap.num;
+      den = g_clock_snap.den;
+      std::atomic_thread_fence(std::memory_order_acquire);
+      if (g_clock_snap.seq.load(std::memory_order_relaxed) == s1) {
+        break;
+      }
     }
-    // Wait until another thread has finished updating the clock.
-    lock.lock();
-    return last_guest_tick_count_.load(std::memory_order_acquire);
+    const uint64_t host_tick_delta = host_tick_count > base_host ? host_tick_count - base_host : 0;
+    return base_guest + ScaleDelta(host_tick_delta, num, den);
   }
+  std::unique_lock<std::mutex> lock(tick_mutex_);
+  uint64_t host_tick_delta =
+      host_tick_count > last_host_tick_count_ ? host_tick_count - last_host_tick_count_ : 0;
+  last_host_tick_count_ = host_tick_count;
+  uint64_t guest_tick_delta =
+      ScaleDelta(host_tick_delta, guest_tick_ratio_.first, guest_tick_ratio_.second);
+  const uint64_t guest_tick_count =
+      last_guest_tick_count_.load(std::memory_order_relaxed) + guest_tick_delta;
+  last_guest_tick_count_.store(guest_tick_count, std::memory_order_release);
+  return guest_tick_count;
 }
 
 // Offset of the current guest system file time relative to the guest base time.

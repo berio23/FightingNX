@@ -70,6 +70,14 @@ def hooked():
                 text = re.sub(r'non_argument_as_local_keep\s*=\s*\[.*?\]', ' ', text, flags=re.S)
             for m in re.findall(r'(?<![0-9A-Fa-f])(82[0-9A-Fa-f]{6})(?![0-9A-Fa-f])', text):
                 names.add('sub_' + m.upper())
+    import glob
+    for inc in glob.glob(os.path.join(APP, 'generated', 'hot', 'localized_bulk_hooks_*.inc')):
+        try:
+            text = open(inc, encoding='utf-8', errors='ignore').read()
+        except OSError:
+            continue
+        for m in re.findall(r'SA2_HOT_HOOK(?:_UNGUARDED|_COPY)?\(([0-9A-Fa-f]{8}),', text):
+            names.add('sub_' + m.upper())
     return names
 
 

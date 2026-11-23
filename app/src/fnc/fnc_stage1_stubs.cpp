@@ -8,13 +8,6 @@ uint64_t PresentedSwaps() { return 0; }
 void SetPresentHook(void (*)(uint64_t)) {}
 }  // namespace me::native
 
-// Stage 2: whether the generated code marks the store cards (tools/store_cards.py, the optimised codegen flavour only),
-// which Renut's renderer reads (banjo_renut_tuning.cpp). sa2-nx defines it in src/cpu/sa2_hot_guest.cpp from the
-// generated pch's REX_CARD; that file holds SA2's native replacements and is not built for FNC. FNC's codegen is the
-// classic flavour, which never marks them: false. Before an optimised FNC build, define it where the generated pch is
-// included (REX_CARD), as sa2_hot_guest.cpp does.
-extern "C" const bool g_banjo_store_cards = false;
-
 // Stage 2: Renut's frame pacing (renut_engine/gpu/sa2_renut_pacing.cpp) reads the relaxed-vsync switch, which sa2-nx
 // defines in src/me/me_native_system.cpp (option A's PM4 renderer: SA2 addresses, not built for FNC). The same
 // definition, with its key sa2_vsync_relaxed.

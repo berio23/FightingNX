@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
+
 #include <rex/kernel/xam/apps/xmp_app.h>
 #include <rex/logging.h>
 #include <rex/system/xthread.h>
@@ -37,9 +39,20 @@ XmpApp::XmpApp(KernelState* kernel_state)
 
 X_HRESULT XmpApp::XMPGetStatus(uint32_t state_ptr) {
   if (!XThread::GetCurrentThread()->main_thread()) {
-    // Some stupid games will hammer this on a thread - induce a delay
-    // here to keep from starving real threads.
-    rex::thread::Sleep(std::chrono::milliseconds(1));
+    // Only throttle if a non-main thread spins tightly on XMPGetStatus (>= 8 calls within 1 ms).
+    thread_local std::chrono::steady_clock::time_point last_call{};
+    thread_local uint32_t burst = 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (last_call.time_since_epoch().count() != 0 &&
+        (now - last_call) < std::chrono::milliseconds(1)) {
+      if (++burst >= 8) {
+        burst = 0;
+        rex::thread::Sleep(std::chrono::milliseconds(1));
+      }
+    } else {
+      burst = 0;
+    }
+    last_call = now;
   }
 
   REXKRNL_TRACE("XMPGetStatus({:08X})", state_ptr);

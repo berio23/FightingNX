@@ -1166,6 +1166,17 @@ struct Targets {
 // FillTextures binds (a destination is not sampled from the image of a target of its own draw), and what is done
 // before a depth target is bound again.
 const Targets *g_handover_targets = nullptr;
+bool IsHandoverTarget(const HostSurface *surface) {
+  if (!surface || !g_handover_targets)
+    return false;
+  if (g_handover_targets->depth == surface)
+    return true;
+  for (uint32_t i = 0; i < g_handover_targets->color_count; ++i) {
+    if (g_handover_targets->colors[i] == surface)
+      return true;
+  }
+  return false;
+}
 void DepthHandOverBeforeBindLocked(HostSurface *surface, const plume::RenderRect *clear_rect, u32 clear_flags);
 
 // A rect in guest pixels as host pixels of targets 'scale' times the size.
@@ -1187,14 +1198,17 @@ bool GatherTargets(const GuestDevice &device, Targets &t) {
   HostSurface *depth = GetHostSurfaceLocked(device.U32(d3d::kDeviceOffsetDepthStencil));
   if (depth && depth->depth)
     t.depth = depth;
-  // fnc-nx (2026-11-21): a depth target smaller than the colour target, for a draw that neither tests nor writes depth
-  // nor uses stencil (RB_DEPTHCONTROL bits 0-2 clear), is left out. FNC composites its fighters' 1024x1024 texture
-  // sheets (shorts, gloves) with a 512x512 depth surface still bound: on the Xbox 360 the unused depth costs nothing,
-  // on the host past its edge is undefined (D3D12) or a "ZT width violation" (Maxwell), and the sheets came out
-  // black and transparent (the fighters' gloves and shorts on the console).
-  if (t.depth && t.color_count && (t.depth->width < t.colors[0]->width || t.depth->height < t.colors[0]->height) &&
-      !(u32(device.dev().m_ControlPacket.DepthControl) & 0x7u))
+  // fnc-nx (2026-11-21): a depth target smaller than the colour target causes undefined reads on D3D12 or a Maxwell
+  // "ZT width violation" on Tegra X1 when rendering FNC's 1024x1024 fighter texture sheets while a 512x512 depth
+  // buffer is still bound. Drop any undersized depth target on FNC / deko3d to prevent GPU target corruption.
+#if RENUT_GAME_FNC
+  if (t.depth && t.color_count && (t.depth->width < t.colors[0]->width || t.depth->height < t.colors[0]->height))
     t.depth = nullptr;
+#else
+  if (t.depth && t.color_count && (t.depth->width < t.colors[0]->width || t.depth->height < t.colors[0]->height) &&
+      (IsDeko3D() || !(u32(device.dev().m_ControlPacket.DepthControl) & 0x7u)))
+    t.depth = nullptr;
+#endif
   if (!t.color_count && !t.depth)
     return false;
   const HostSurface *first = t.color_count ? t.colors[0] : t.depth;
@@ -2084,7 +2098,7 @@ void FillTextures(const GuestDevice &device, u32 fetch_mask, SharedConstants &sc
         (!m.fx.depth_source || m.depth_epoch == g_depth_epoch) &&
         std::memcmp(m.device, fetch.dword, sizeof(m.device)) == 0 &&
         std::memcmp(m.header, &header->Format, sizeof(m.header)) == 0 &&
-        !(m.fx.handover_surface && g_handover_targets && g_handover_targets->depth == m.fx.handover_surface)) {
+        !IsHandoverTarget(m.fx.handover_surface)) {
       for (HostTexture *t : m.fx.transition)
         if (t)
           TransitionTextureLocked(t, plume::RenderTextureLayout::SHADER_READ);
@@ -4086,6 +4100,7 @@ void DrawLog(const DrawCall &call, const Geometry &geometry, const ShaderRecord 
 // sa2-nx (2026-10-20, sa2_renut_chain_reuse): the previous chain draw's targets and viewport (DrawStateLocked).
 struct TargetsReuse {
   uint64_t seq = 0, epoch = 0;
+  u32 depth_control_bits = 0;
   u32 va[d3d::kMaxRenderTargets + 1] = {};       // the device's render target words and its depth word
   u32 desc[d3d::kMaxRenderTargets + 1][3] = {};  // each one's Size, SurfaceInfo, Format (GetHostSurfaceLocked's)
   Targets targets;
@@ -4216,16 +4231,20 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   if (!host_vs || (ps && !host_ps))
     return false;  // missing from the shader cache (captured for the next build)
 
-  // sa2-nx (2026-10-20, sa2_renut_chain_reuse): the previous chain draw's targets when the device's target words (bytes
-  // 12816-12835) did not change, no target was built, retired or rebound since (the surface epoch), and the targets'
-  // descriptor words (which GetHostSurfaceLocked reads in guest memory) are the same.
+  // sa2-nx (2026-10-20, sa2_renut_chain_reuse): the previous chain draw's targets when the device's target words
+  // (kDeviceOffsetRenderTargets..kDeviceOffsetDepthStencil+3) did not change, no target was built, retired or rebound
+  // since (the surface epoch), and the targets' descriptor words (which GetHostSurfaceLocked reads in guest memory) are
+  // the same.
   static const bool targets_reuse_on = REXCVAR_GET(sa2_renut_chain_reuse);
   static const bool targets_verify = targets_reuse_on && REXCVAR_GET(sa2_renut_chain_reuse_verify);
   const ChainHint &chain = g_chain_hint;
+  const u32 depth_control_bits = u32(device.dev().m_ControlPacket.DepthControl) & 0x7u;
   Targets targets;
   bool targets_reused = false;
-  if (targets_reuse_on && chain.seq && chain.seq == g_targets_reuse.seq + 1 && !ChainChanged(chain, 12816, 12835) &&
-      g_targets_reuse.epoch == SurfaceEpochLocked()) {
+  if (targets_reuse_on && chain.seq && chain.seq == g_targets_reuse.seq + 1 &&
+      !ChainChanged(chain, d3d::kDeviceOffsetRenderTargets, d3d::kDeviceOffsetDepthStencil + 3) &&
+      g_targets_reuse.epoch == SurfaceEpochLocked() &&
+      g_targets_reuse.depth_control_bits == depth_control_bits) {
     targets_reused = true;
     for (u32 i = 0; targets_reused && i <= d3d::kMaxRenderTargets; ++i) {
       u32 words[3];
@@ -4254,6 +4273,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     g_targets_reuse.seq = chain.seq;
     g_targets_reuse.epoch = SurfaceEpochLocked();
     if (!targets_reused) {
+      g_targets_reuse.depth_control_bits = depth_control_bits;
       for (u32 i = 0; i <= d3d::kMaxRenderTargets; ++i) {
         g_targets_reuse.va[i] = device.U32(i < d3d::kMaxRenderTargets ? d3d::kDeviceOffsetRenderTargets + i * 4
                                                                        : d3d::kDeviceOffsetDepthStencil);
@@ -4340,6 +4360,8 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   struct TexturesReuse {
     uint64_t seq = 0, frame = 0, epoch = 0, depth_epoch = 0;
     u32 mask = 0;
+    u32 color_count = 0;
+    const HostSurface *colors[d3d::kMaxRenderTargets] = {};
     const HostSurface *depth = nullptr;
     u32 header[32][6] = {};
     BindEffects fx[32];
@@ -4347,10 +4369,14 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     u32 samplers[32] = {};
   };
   static TexturesReuse treuse;
-  bool textures_reused = targets_reuse_on && chain.seq && chain.seq == treuse.seq + 1 && treuse.mask == texture_mask &&
-                         !ChainChanged(chain, 1152, 1775) && !ChainChanged(chain, 12920, 13023) &&
-                         treuse.frame == TextureFrameLocked() && treuse.epoch == g_texture_epoch &&
-                         treuse.depth_epoch == g_depth_epoch && treuse.depth == targets.depth;
+  bool textures_reused =
+      targets_reuse_on && chain.seq && chain.seq == treuse.seq + 1 && treuse.mask == texture_mask &&
+      !ChainChanged(chain, 1152, 1775) &&
+      !ChainChanged(chain, d3d::kDeviceOffsetTextures, d3d::kDeviceOffsetTextures + d3d::kTextureFetchSlots * 4 - 1) &&
+      treuse.frame == TextureFrameLocked() && treuse.epoch == g_texture_epoch &&
+      treuse.depth_epoch == g_depth_epoch && treuse.depth == targets.depth &&
+      treuse.color_count == targets.color_count &&
+      std::memcmp(treuse.colors, targets.colors, targets.color_count * sizeof(targets.colors[0])) == 0;
   for (u32 r = 0; textures_reused && r < d3d::kTextureFetchSlots; ++r) {
     if (!(texture_mask & (1u << r)))
       continue;
@@ -4404,6 +4430,9 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
       treuse.frame = TextureFrameLocked();
       treuse.epoch = g_texture_epoch;
       treuse.depth_epoch = g_depth_epoch;
+      treuse.color_count = targets.color_count;
+      for (u32 i = 0; i < targets.color_count; ++i)
+        treuse.colors[i] = targets.colors[i];
       treuse.depth = targets.depth;
       for (u32 r = 0; r < d3d::kTextureFetchSlots; ++r) {
         if (!(texture_mask & (1u << r)))
@@ -4683,9 +4712,13 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     // sa2-nx (2026-10-20, sa2_renut_chain_reuse): a chain draw whose texture words are the previous draw's, when that
     // draw pushed last (no push since, the same command list's buffer): its first 512 bytes are held already.
     static uint64_t texture_push_seq = 0, texture_push_count = 0;
+#if RENUT_GAME_FNC
+    const bool texture_lines_held = false;
+#else
     const bool texture_lines_held = textures_reused && !targets_verify && chain.seq &&
                                     texture_push_seq + 1 == chain.seq && texture_push_count == g_shared_pushes &&
                                     g_bound.pushed_shared_valid;
+#endif
     // sa2-nx (2026-10-20, sa2_renut_fetch_slots_skip): no fetches in this draw and none in the last push: both have
     // the fetch slots zero (sc is zeroed there; only UploadVertexFetchData writes them, for the fetch mask's bits).
     static const bool fetch_slots_skip = REXCVAR_GET(sa2_renut_fetch_slots_skip);
@@ -5303,6 +5336,8 @@ bool ResolveDepth(HostSurface *surface, HostTexture *dest, const ClearRect &src,
   cmd->setGraphicsPushConstants(0, &push, 0, sizeof(push));
   cmd->drawInstanced(3, 1, 0, 0);
   TransitionTextureLocked(dest, plume::RenderTextureLayout::SHADER_READ);
+  if (words && dest->words)
+    TransitionTextureLocked(dest->words.get(), plume::RenderTextureLayout::SHADER_READ);
 
   // The draw path binds its own layout, pipeline, targets and viewport again.
   g_bound.framebuffer = nullptr;
@@ -5565,10 +5600,10 @@ void ClearStateLocked(const u8 *device_state, u32 flags, const ClearRect *rect,
   if (!GatherTargets(device, targets))
     return;
 
-  // D3D clamps clears to the viewport (CDevice viewport floats at 0x3168).
+  // D3D clamps clears to the viewport (CDevice viewport floats).
   ClearRect r = rect ? *rect : ClearRect{0, 0, int32_t(targets.width), int32_t(targets.height)};
-  const float vx = device.F32(0x3168), vy = device.F32(0x316C);
-  const float vw = device.F32(0x3170), vh = device.F32(0x3174);
+  const float vx = device.F32(d3d::kDeviceOffsetViewport), vy = device.F32(d3d::kDeviceOffsetViewport + 4);
+  const float vw = device.F32(d3d::kDeviceOffsetViewport + 8), vh = device.F32(d3d::kDeviceOffsetViewport + 12);
   if (vw > 0.0f && vh > 0.0f) {
     int32_t vx2 = int32_t(vx + vw), vy2 = int32_t(vy + vh);
     // A target grown for tiling: D3D bounds the viewport by the tile-sized

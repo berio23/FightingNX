@@ -543,12 +543,6 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     g_measurement_xma.kick_contexts.fetch_add(kick_contexts, std::memory_order_relaxed);
     g_measurement_xma.kick_ns.fetch_add(kick_ns, std::memory_order_relaxed);
     MaxXma(g_measurement_xma.kick_max_ns, kick_ns);
-    if (worker_mode == 0) {
-      // With the worker already notified above, repeating the notification leaves the (auto-reset) event
-      // signaled after its iteration and costs a full sweep of the 320 contexts per kick, 1,555 times per
-      // second.
-      work_event_->Set();
-    }
     ReportXma();
   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
     // Context lock command.
