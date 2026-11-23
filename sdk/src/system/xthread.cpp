@@ -50,6 +50,11 @@ REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
 
 #if REX_PLATFORM_SWITCH
+REXCVAR_DEFINE_INT32(fnc_audio_mixer_priority, REX_SWITCH_PRIO_GUEST - 1, "Audio",
+                     "Switch priority of the Fight Night Champion DAC mixer (lower is more urgent)")
+    .range(REX_SWITCH_PRIO_AUDIO, REX_SWITCH_PRIO_GUEST - 1)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace {
 // sa2-nx (2026-10-20, RexSetGuestThreadCoreLayout): the guest threads' cores besides the main thread's (0: the
 // process's, as before), and the preferred one among them, for the threads created from then on.
@@ -78,8 +83,9 @@ void ApplyGuestCoreLayoutAtWait() {
   // priority here (Horizon's svcSetThreadPriority on the current thread).
   if (XThread* self = XThread::GetCurrentThread();
       self && self->audio_mixer_priority_pending_.exchange(false, std::memory_order_acq_rel)) {
-    const bool ok = RexSwitchSetCurrentThreadPriorityOk(REX_SWITCH_PRIO_GUEST - 1);
-    REXSYS_INFO("[fnc] the game's audio mixer thread at priority {:#x}: {}", REX_SWITCH_PRIO_GUEST - 1,
+    const int priority = REXCVAR_GET(fnc_audio_mixer_priority);
+    const bool ok = RexSwitchSetCurrentThreadPriorityOk(priority);
+    REXSYS_INFO("[fnc] the game's audio mixer thread at priority {:#x}: {}", priority,
                 ok ? "set" : "FAILED");
   }
   const uint32_t gen = g_guest_layout_gen.load(std::memory_order_acquire);

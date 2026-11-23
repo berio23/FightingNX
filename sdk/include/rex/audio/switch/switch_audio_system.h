@@ -29,7 +29,8 @@ class SwitchAudioDriver final : public AudioDriver {
   static constexpr uint32_t kChannelSamples = 256;
   static constexpr uint32_t kFrameSamples = kChannels * kChannelSamples;
 
-  SwitchAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore);
+  SwitchAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore,
+                    bool retry_silent_frames);
   ~SwitchAudioDriver() override;
 
   void SubmitFrame(uint32_t frame_ptr) override;
@@ -47,6 +48,9 @@ class SwitchAudioDriver final : public AudioDriver {
 
  private:
   rex::thread::Semaphore* semaphore_;
+  const bool retry_silent_frames_;
+  unsigned silent_retries_left_ = 0;
+  uint64_t silent_frames_retried_ = 0;
   std::mutex frames_mutex_;
   std::queue<float*> frames_queued_;
   std::stack<float*> frames_unused_;

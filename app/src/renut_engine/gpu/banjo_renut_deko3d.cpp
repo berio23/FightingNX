@@ -234,12 +234,19 @@ bool PackageScales() {
   // installer page) has every texture's scale code folded to 0: drawn above 1x, its shaders would take host texel
   // sizes for guest ones. The passes leave the code's read, "(... >> 26u) & 7u", in every shader that has one (SA2:
   // 5 pixel shaders without scale1, none with it), so a package scales when each package in use has it somewhere.
+  // An external package takes precedence. If it covers every built-in shader, only its code can be drawn.
   static const bool scales = [] {
     Packages &all = Open();
+    const Package &external = all.source[0];
+    const Package &built_in = all.source[1];
+    const bool replaces_built_in = external.ok && built_in.ok &&
+        std::includes(external.entries, external.entries + external.header->count,
+                      built_in.entries, built_in.entries + built_in.header->count,
+                      [](const PackageEntry &a, const PackageEntry &b) { return a.hash < b.hash; });
     static constexpr char kScaleCode[] = ">> 26u) & 7u";
     bool any = false;
     for (Package &p : all.source) {
-      if (!p.ok)
+      if (!p.ok || (&p == &built_in && replaces_built_in))
         continue;
       any = true;
       bool found = false;

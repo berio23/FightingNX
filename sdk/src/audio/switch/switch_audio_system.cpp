@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -42,6 +43,9 @@ REXCVAR_DEFINE_INT32(audio_switch_frames_in_queue, 10, "Audio",
                      "when the audio is opened");
 REXCVAR_DEFINE_BOOL(audio_switch_conceal_gaps, false, "Audio",
                     "Smooth silent 256-sample gaps in the stereo mix with one block of lookahead");
+REXCVAR_DEFINE_BOOL(fnc_audio_retry_silent_frames, false, "Audio",
+                    "Sanitize mixer samples and retry brief dropouts while the Switch has buffered audio")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::audio::nx {
 
@@ -69,6 +73,24 @@ constexpr u64 kWaitTimeoutNs = 100'000'000;
 constexpr u64 kPumpIntervalNs = 1'000'000'000ull * SwitchAudioDriver::kChannelSamples / 48000;
 constexpr size_t kTargetQueuedFrames = 6;
 constexpr size_t kMinQueuedFrames = 2;
+constexpr unsigned kMaxSilentRetries = 2;
+
+// Mixer samples are still big-endian here. Drop NaNs and infinities per channel
+// so one invalid channel cannot mute a whole stereo sample during the downmix.
+bool SanitizeMixerFrame(float* frame) {
+  constexpr uint32_t kExponentMask = rex::byte_swap(uint32_t{0x7F800000});
+  constexpr uint32_t kMagnitudeMask = rex::byte_swap(uint32_t{0x7FFFFFFF});
+  uint32_t valid_magnitude = 0;
+  for (size_t i = 0; i < SwitchAudioDriver::kFrameSamples; ++i) {
+    const auto sample = std::bit_cast<uint32_t>(frame[i]);
+    if ((sample & kExponentMask) == kExponentMask) {
+      frame[i] = 0.0f;
+    } else {
+      valid_magnitude |= sample & kMagnitudeMask;
+    }
+  }
+  return valid_magnitude == 0;
+}
 
 // The fight mixer can hand us a whole silent block between two active blocks.
 // A reflected, tapered copy of each neighboring block joins the waveforms
@@ -127,11 +149,15 @@ class AudioGapConcealer {
 
 /* --- driver ------------------------------------------------------------------ */
 
-SwitchAudioDriver::SwitchAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore)
-    : AudioDriver(memory), semaphore_(semaphore) {}
+SwitchAudioDriver::SwitchAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore,
+                                     bool retry_silent_frames)
+    : AudioDriver(memory), semaphore_(semaphore), retry_silent_frames_(retry_silent_frames) {}
 
 SwitchAudioDriver::~SwitchAudioDriver() {
   std::lock_guard<std::mutex> guard(frames_mutex_);
+  if (retry_silent_frames_) {
+    REXLOG_INFO("[fnc audio] requested replacements for {} silent mixer blocks", silent_frames_retried_);
+  }
   while (!frames_unused_.empty()) {
     delete[] frames_unused_.top();
     frames_unused_.pop();
@@ -157,8 +183,27 @@ void SwitchAudioDriver::SubmitFrame(uint32_t frame_ptr) {
     }
   }
   std::memcpy(output_frame, input_frame, kFrameSamples * sizeof(float));
-  std::lock_guard<std::mutex> guard(frames_mutex_);
-  frames_queued_.push(output_frame);
+  const bool silent = retry_silent_frames_ && SanitizeMixerFrame(output_frame);
+  {
+    std::lock_guard<std::mutex> guard(frames_mutex_);
+    if (!retry_silent_frames_) {
+      frames_queued_.push(output_frame);
+      return;
+    }
+    // During a short dropout the mixer can continue the interrupted waveform on its next
+    // callback. Retry while a whole buffer remains queued, at most twice after real PCM.
+    // A sustained pause, or a draining queue, must still be served at the device rate.
+    if (silent && silent_retries_left_ && frames_queued_.size() >= kFramesPerBuffer) {
+      --silent_retries_left_;
+      ++silent_frames_retried_;
+      frames_unused_.push(output_frame);
+    } else {
+      silent_retries_left_ = silent ? 0 : kMaxSilentRetries;
+      frames_queued_.push(output_frame);
+      return;
+    }
+  }
+  RequestFrame();
 }
 
 bool SwitchAudioDriver::MixFrameInto(float* stereo_out, const StereoFold& fold, float gain,
@@ -239,7 +284,8 @@ X_STATUS SwitchAudioSystem::CreateDriver([[maybe_unused]] size_t index,
   if (!output_ && !StartOutput()) {
     return X_STATUS_UNSUCCESSFUL;
   }
-  auto driver = new SwitchAudioDriver(memory_, semaphore);
+  auto driver = new SwitchAudioDriver(memory_, semaphore,
+                                      output_->pump && REXCVAR_GET(fnc_audio_retry_silent_frames));
   {
     std::lock_guard<std::mutex> guard(drivers_mutex_);
     drivers_.push_back(driver);
