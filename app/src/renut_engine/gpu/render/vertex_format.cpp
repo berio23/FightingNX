@@ -206,7 +206,10 @@ plume::RenderFormat PassthroughFormat(const DeclType &type, const FormatInfo &in
   }
 }
 
-u32 SwapDword(u32 value, u32 endian) {
+#if defined(__GNUC__) || defined(__clang__)
+[[gnu::always_inline]]
+#endif
+inline u32 SwapDword(u32 value, u32 endian) {
   switch (endian) {
   case 1: // 8in16
     return ((value & 0x00FF00FFu) << 8) | ((value >> 8) & 0x00FF00FFu);
@@ -753,7 +756,10 @@ HostVertexLayout BuildHostVertexLayout(const GuestVertexElement *elements, u32 c
 namespace {
 
 template <u32 kEndian>
-void SwapWordsAs(const u8 *src, u8 *dst, size_t words) {
+#if defined(__GNUC__) || defined(__clang__)
+[[gnu::always_inline]]
+#endif
+inline void SwapWordsAs(const u8 *src, u8 *dst, size_t words) {
   for (size_t i = 0; i < words; ++i) {
     u32 value;
     std::memcpy(&value, src + i * 4, 4);
@@ -761,6 +767,199 @@ void SwapWordsAs(const u8 *src, u8 *dst, size_t words) {
     std::memcpy(dst + i * 4, &value, 4);
   }
 }
+
+#if defined(__aarch64__)
+template <u32 kLoadVecs>
+struct NeonTblLoader {};
+template <>
+struct NeonTblLoader<1> {
+  static inline uint8x16_t Load(const u8 *p) { return vld1q_u8(p); }
+  static inline uint8x16_t Tbl(uint8x16_t v, uint8x16_t t) { return vqtbl1q_u8(v, t); }
+};
+template <>
+struct NeonTblLoader<2> {
+  static inline uint8x16x2_t Load(const u8 *p) { return vld1q_u8_x2(p); }
+  static inline uint8x16_t Tbl(uint8x16x2_t v, uint8x16_t t) { return vqtbl2q_u8(v, t); }
+};
+template <>
+struct NeonTblLoader<3> {
+  static inline uint8x16x3_t Load(const u8 *p) { return vld1q_u8_x3(p); }
+  static inline uint8x16_t Tbl(uint8x16x3_t v, uint8x16_t t) { return vqtbl3q_u8(v, t); }
+};
+template <>
+struct NeonTblLoader<4> {
+  static inline uint8x16x4_t Load(const u8 *p) { return vld1q_u8_x4(p); }
+  static inline uint8x16_t Tbl(uint8x16x4_t v, uint8x16_t t) { return vqtbl4q_u8(v, t); }
+};
+
+template <u32 kLoadVecs>
+void RunNeonTblStream(const u8 *src, u32 src_stride, u8 *dst, u32 dst_stride, u32 count,
+                      const uint8_t perm[64]) {
+  using L = NeonTblLoader<kLoadVecs>;
+  if (dst_stride == 4) {
+    const uint8x16_t t0 = vld1q_u8(perm);
+    for (u32 v = 0; v < count; ++v, src += src_stride, dst += 4) {
+      const uint32_t w = vgetq_lane_u32(vreinterpretq_u32_u8(L::Tbl(L::Load(src), t0)), 0);
+      std::memcpy(dst, &w, 4);
+    }
+  } else if (dst_stride == 8) {
+    const uint8x16_t t0 = vld1q_u8(perm);
+    for (u32 v = 0; v < count; ++v, src += src_stride, dst += 8)
+      vst1_u8(dst, vget_low_u8(L::Tbl(L::Load(src), t0)));
+  } else if (dst_stride == 12) {
+    const uint8x16_t t0 = vld1q_u8(perm);
+    for (u32 v = 0; v < count; ++v, src += src_stride, dst += 12) {
+      const uint8x16_t r = L::Tbl(L::Load(src), t0);
+      vst1_u8(dst, vget_low_u8(r));
+      const uint32_t w = vgetq_lane_u32(vreinterpretq_u32_u8(r), 2);
+      std::memcpy(dst + 8, &w, 4);
+    }
+  } else if (dst_stride == 16) {
+    const uint8x16_t t0 = vld1q_u8(perm);
+    for (u32 v = 0; v < count; ++v, src += src_stride, dst += 16)
+      vst1q_u8(dst, L::Tbl(L::Load(src), t0));
+  } else if (dst_stride < 32) {
+    const u32 tail_off = dst_stride - 16;
+    const uint8x16_t t0 = vld1q_u8(perm);
+    const uint8x16_t tt = vld1q_u8(perm + tail_off);
+    for (u32 v = 0; v < count; ++v, src += src_stride, dst += dst_stride) {
+      const auto data = L::Load(src);
+      vst1q_u8(dst, L::Tbl(data, t0));
+      vst1q_u8(dst + tail_off, L::Tbl(data, tt));
+    }
+  } else if (dst_stride == 32) {
+    const uint8x16_t t0 = vld1q_u8(perm);
+    const uint8x16_t t1 = vld1q_u8(perm + 16);
+    for (u32 v = 0; v < count; ++v, src += src_stride, dst += 32) {
+      const auto data = L::Load(src);
+      vst1q_u8(dst, L::Tbl(data, t0));
+      vst1q_u8(dst + 16, L::Tbl(data, t1));
+    }
+  } else if (dst_stride < 48) {
+    const u32 tail_off = dst_stride - 16;
+    const uint8x16_t t0 = vld1q_u8(perm);
+    const uint8x16_t t1 = vld1q_u8(perm + 16);
+    const uint8x16_t tt = vld1q_u8(perm + tail_off);
+    for (u32 v = 0; v < count; ++v, src += src_stride, dst += dst_stride) {
+      const auto data = L::Load(src);
+      vst1q_u8(dst, L::Tbl(data, t0));
+      vst1q_u8(dst + 16, L::Tbl(data, t1));
+      vst1q_u8(dst + tail_off, L::Tbl(data, tt));
+    }
+  } else if (dst_stride == 48) {
+    const uint8x16_t t0 = vld1q_u8(perm);
+    const uint8x16_t t1 = vld1q_u8(perm + 16);
+    const uint8x16_t t2 = vld1q_u8(perm + 32);
+    for (u32 v = 0; v < count; ++v, src += src_stride, dst += 48) {
+      const auto data = L::Load(src);
+      vst1q_u8(dst, L::Tbl(data, t0));
+      vst1q_u8(dst + 16, L::Tbl(data, t1));
+      vst1q_u8(dst + 32, L::Tbl(data, t2));
+    }
+  } else if (dst_stride < 64) {
+    const u32 tail_off = dst_stride - 16;
+    const uint8x16_t t0 = vld1q_u8(perm);
+    const uint8x16_t t1 = vld1q_u8(perm + 16);
+    const uint8x16_t t2 = vld1q_u8(perm + 32);
+    const uint8x16_t tt = vld1q_u8(perm + tail_off);
+    for (u32 v = 0; v < count; ++v, src += src_stride, dst += dst_stride) {
+      const auto data = L::Load(src);
+      vst1q_u8(dst, L::Tbl(data, t0));
+      vst1q_u8(dst + 16, L::Tbl(data, t1));
+      vst1q_u8(dst + 32, L::Tbl(data, t2));
+      vst1q_u8(dst + tail_off, L::Tbl(data, tt));
+    }
+  } else {
+    const uint8x16_t t0 = vld1q_u8(perm);
+    const uint8x16_t t1 = vld1q_u8(perm + 16);
+    const uint8x16_t t2 = vld1q_u8(perm + 32);
+    const uint8x16_t t3 = vld1q_u8(perm + 48);
+    for (u32 v = 0; v < count; ++v, src += src_stride, dst += 64) {
+      const auto data = L::Load(src);
+      vst1q_u8(dst, L::Tbl(data, t0));
+      vst1q_u8(dst + 16, L::Tbl(data, t1));
+      vst1q_u8(dst + 32, L::Tbl(data, t2));
+      vst1q_u8(dst + 48, L::Tbl(data, t3));
+    }
+  }
+}
+
+// Single-pass NEON byte-permutation converter for all-Copy32 streams (handles mixed swap_halves and repacked strides
+// without the multi-pass chunk[] bounce buffer or per-vertex SwapDword calls). Returns number of vertices converted.
+u32 ConvertVerticesNeonCopyOnly(const HostVertexStream &stream, const u8 *guest, u32 guest_stride,
+                                u32 vertex_count, u32 endian, u8 *host) {
+  const u32 host_stride = stream.host_stride;
+  if (vertex_count < 4 || guest_stride == 0 || guest_stride > 64 || host_stride < 4 || host_stride > 64 ||
+      (host_stride & 3u) != 0)
+    return 0;
+  alignas(16) uint8_t perm[64];
+  std::memset(perm, 0xFF, sizeof(perm));
+  u32 max_src_end = 0;
+  for (const HostVertexElement &element : stream.elements) {
+    if ((element.host_size & 3u) != 0 || element.guest_offset + element.host_size > guest_stride ||
+        element.host_offset + element.host_size > host_stride)
+      return 0;
+    const u32 e = (element.swap_halves ? (endian ^ 3u) : endian) & 3u;
+    const u32 words = element.host_size / 4;
+    for (u32 w = 0; w < words; ++w) {
+      const u8 s = u8(element.guest_offset + w * 4);
+      const u8 d = u8(element.host_offset + w * 4);
+      switch (e) {
+      case 1:  // 8in16
+        perm[d + 0] = u8(s + 1);
+        perm[d + 1] = u8(s + 0);
+        perm[d + 2] = u8(s + 3);
+        perm[d + 3] = u8(s + 2);
+        break;
+      case 2:  // 8in32
+        perm[d + 0] = u8(s + 3);
+        perm[d + 1] = u8(s + 2);
+        perm[d + 2] = u8(s + 1);
+        perm[d + 3] = u8(s + 0);
+        break;
+      case 3:  // 16in32
+        perm[d + 0] = u8(s + 2);
+        perm[d + 1] = u8(s + 3);
+        perm[d + 2] = u8(s + 0);
+        perm[d + 3] = u8(s + 1);
+        break;
+      default:
+        perm[d + 0] = u8(s + 0);
+        perm[d + 1] = u8(s + 1);
+        perm[d + 2] = u8(s + 2);
+        perm[d + 3] = u8(s + 3);
+        break;
+      }
+    }
+    max_src_end = std::max(max_src_end, element.guest_offset + element.host_size);
+  }
+  if (max_src_end == 0 || max_src_end > 64)
+    return 0;
+  const u32 load_vecs = (max_src_end + 15u) / 16u;
+  const u32 load_bytes = load_vecs * 16u;
+  const size_t total_guest_bytes = size_t(vertex_count) * guest_stride;
+  if (total_guest_bytes < load_bytes)
+    return 0;
+  const u32 safe_count = std::min<u32>(vertex_count, u32((total_guest_bytes - load_bytes) / guest_stride + 1));
+  if (safe_count == 0)
+    return 0;
+  switch (load_vecs) {
+  case 1:
+    RunNeonTblStream<1>(guest, guest_stride, host, host_stride, safe_count, perm);
+    break;
+  case 2:
+    RunNeonTblStream<2>(guest, guest_stride, host, host_stride, safe_count, perm);
+    break;
+  case 3:
+    RunNeonTblStream<3>(guest, guest_stride, host, host_stride, safe_count, perm);
+    break;
+  default:
+    RunNeonTblStream<4>(guest, guest_stride, host, host_stride, safe_count, perm);
+    break;
+  }
+  return safe_count;
+}
+#endif
 
 #if defined(__aarch64__)
 // banjo-nx (banjo_renut_neon_swap): 16 bytes per NEON byte reverse, the same bytes SwapDword gives each word:
@@ -881,21 +1080,33 @@ void CopyElementWords(const u8 *src, u32 src_stride, u8 *dst, u32 dst_stride, u3
 
 void ConvertVertices(const HostVertexStream &stream, const u8 *guest, u32 guest_stride,
                      u32 vertex_count, u32 endian, u8 *host) {
-  bool copy_only = true, same_layout = stream.host_stride == guest_stride && guest_stride % 4 == 0;
+  bool all_copy32 = true, no_swap_halves = true;
+  bool same_layout = stream.host_stride == guest_stride && guest_stride % 4 == 0;
   for (const HostVertexElement &element : stream.elements) {
-    copy_only &= element.conversion == ElementConversion::Copy32 && !element.swap_halves;
+    all_copy32 &= element.conversion == ElementConversion::Copy32;
+    no_swap_halves &= !element.swap_halves;
     same_layout &= element.host_offset == element.guest_offset;
   }
   // Swapping the halves after any endian swap is the endian mode ^ 3
   // (8in32 <-> 8in16, none <-> 16in32).
   constexpr u32 kSwapHalves = 3;
-  if (copy_only && same_layout) {
+  if (all_copy32 && no_swap_halves && same_layout) {
     // The host vertices are the guest vertices with their words swapped.
-    // (Elements whose halves swap too take the chunked path below: a second
-    // pass would read back upload memory, which is uncached.)
     SwapWords(guest, host, size_t(vertex_count) * guest_stride / 4, endian);
     return;
   }
+#if defined(__aarch64__)
+  if (all_copy32 && banjo::renut_gpu::NeonSwapOn()) {
+    const u32 done = ConvertVerticesNeonCopyOnly(stream, guest, guest_stride, vertex_count, endian, host);
+    if (done == vertex_count)
+      return;
+    if (done > 0) {
+      guest += size_t(done) * guest_stride;
+      host += size_t(done) * stream.host_stride;
+      vertex_count -= done;
+    }
+  }
+#endif
   // One element of every vertex at a time, each in a loop with its format and
   // endian mode fixed: deciding them per vertex cost more than the conversion.
   // A chunk of vertices is built in cache and then copied out in one go: the

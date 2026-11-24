@@ -8,6 +8,10 @@
 
 #include <cstring>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 namespace renut::gpu {
 
 plume::RenderFormat ColorTargetFormat(GpuColorFormat format) {
@@ -359,29 +363,66 @@ void SwapEndian(u32 endian, const void *src, void *dst, size_t bytes) {
   const auto *s = static_cast<const uint8_t *>(src);
   auto *d = static_cast<uint8_t *>(dst);
   switch (endian & 3) {
-  case 1:  // 8in16
-    for (size_t i = 0; i + 1 < bytes; i += 2) {
+  case 1: {  // 8in16
+    size_t i = 0;
+#if defined(__aarch64__)
+    for (; i + 32 <= bytes; i += 32) {
+      const uint8x16_t a = vld1q_u8(s + i);
+      const uint8x16_t b = vld1q_u8(s + i + 16);
+      vst1q_u8(d + i, vrev16q_u8(a));
+      vst1q_u8(d + i + 16, vrev16q_u8(b));
+    }
+    for (; i + 16 <= bytes; i += 16)
+      vst1q_u8(d + i, vrev16q_u8(vld1q_u8(s + i)));
+#endif
+    for (; i + 1 < bytes; i += 2) {
       const uint8_t a = s[i], b = s[i + 1];
       d[i] = b;
       d[i + 1] = a;
     }
     break;
-  case 2:  // 8in32
-    for (size_t i = 0; i + 3 < bytes; i += 4) {
+  }
+  case 2: {  // 8in32
+    size_t i = 0;
+#if defined(__aarch64__)
+    for (; i + 32 <= bytes; i += 32) {
+      const uint8x16_t a = vld1q_u8(s + i);
+      const uint8x16_t b = vld1q_u8(s + i + 16);
+      vst1q_u8(d + i, vrev32q_u8(a));
+      vst1q_u8(d + i + 16, vrev32q_u8(b));
+    }
+    for (; i + 16 <= bytes; i += 16)
+      vst1q_u8(d + i, vrev32q_u8(vld1q_u8(s + i)));
+#endif
+    for (; i + 3 < bytes; i += 4) {
       uint32_t v;
       std::memcpy(&v, s + i, 4);
       v = __builtin_bswap32(v);
       std::memcpy(d + i, &v, 4);
     }
     break;
-  case 3:  // 16in32
-    for (size_t i = 0; i + 3 < bytes; i += 4) {
+  }
+  case 3: {  // 16in32
+    size_t i = 0;
+#if defined(__aarch64__)
+    for (; i + 32 <= bytes; i += 32) {
+      const uint16x8_t a = vld1q_u16(reinterpret_cast<const uint16_t *>(s + i));
+      const uint16x8_t b = vld1q_u16(reinterpret_cast<const uint16_t *>(s + i + 16));
+      vst1q_u16(reinterpret_cast<uint16_t *>(d + i), vrev32q_u16(a));
+      vst1q_u16(reinterpret_cast<uint16_t *>(d + i + 16), vrev32q_u16(b));
+    }
+    for (; i + 16 <= bytes; i += 16)
+      vst1q_u16(reinterpret_cast<uint16_t *>(d + i),
+                vrev32q_u16(vld1q_u16(reinterpret_cast<const uint16_t *>(s + i))));
+#endif
+    for (; i + 3 < bytes; i += 4) {
       uint32_t v;
       std::memcpy(&v, s + i, 4);
       v = (v >> 16) | (v << 16);
       std::memcpy(d + i, &v, 4);
     }
     break;
+  }
   default:
     if (d != s)
       std::memmove(d, s, bytes);

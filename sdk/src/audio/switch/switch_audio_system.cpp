@@ -70,7 +70,6 @@ constexpr u64 kWaitTimeoutNs = 100'000'000;
 // audio_switch_pump: one frame (256 samples) every 5.333 ms with absolute deadlines. With this many
 // frames queued or fewer, another one is requested on each tick, and below the minimum one more is
 // requested to catch up (the system clock and the audio clock do not match exactly).
-constexpr u64 kPumpIntervalNs = 1'000'000'000ull * SwitchAudioDriver::kChannelSamples / 48000;
 constexpr size_t kTargetQueuedFrames = 6;
 constexpr size_t kMinQueuedFrames = 2;
 constexpr unsigned kMaxSilentRetries = 2;
@@ -98,8 +97,9 @@ bool SanitizeMixerFrame(float* frame) {
 // goes quiet after the first block and ramps back in on the last block.
 class AudioGapConcealer {
  public:
-  bool Process(int16_t* samples) {
+  bool Process(int16_t* samples, uint32_t* concealed_blocks = nullptr) {
     bool nonzero = false;
+    uint32_t concealed = 0;
     for (size_t frame = 0; frame < kFramesPerBuffer; ++frame, samples += kBlockSize) {
       Block next;
       std::copy_n(samples, kBlockSize, next.begin());
@@ -109,6 +109,7 @@ class AudioGapConcealer {
         previous_ = pending_;
         nonzero = true;
       } else if (previous_active_ || next_active) {
+        ++concealed;
         for (size_t i = 0; i < kBlockSize; i += 2) {
           const size_t mirrored = kBlockSize - 2 - i;
           const float position = float(i) / float(kBlockSize - 2);
@@ -127,6 +128,9 @@ class AudioGapConcealer {
       previous_active_ = pending_active_;
       pending_ = next;
       pending_active_ = next_active;
+    }
+    if (concealed_blocks) {
+      *concealed_blocks = concealed;
     }
     return nonzero;
   }
@@ -261,6 +265,20 @@ struct SwitchAudioSystem::Output {
   std::array<s16*, kBufferCount> samples{};
   std::array<float, kBufferSamples * 2> mix{};
   AudioGapConcealer gap_concealer;
+  // Output-thread-only 10s telemetry: counts raw 256-sample silent blocks & mid-audio dropouts
+  // before gap concealment so regressions cannot hide behind 4-block audout averages or concealment.
+  u64 diag_last_report_tick = 0;
+  uint32_t diag_mixed = 0;
+  uint32_t diag_missing = 0;
+  uint32_t diag_silent_raw = 0;
+  uint32_t diag_dropouts_raw = 0;
+  uint32_t diag_dropout_blocks_raw = 0;
+  uint32_t diag_max_dropout_run = 0;
+  uint32_t diag_concealed = 0;
+  uint32_t diag_current_silent_run = 0;
+  bool diag_seen_active = false;
+  uint32_t diag_q_min = UINT32_MAX;
+  uint32_t diag_q_max = 0;
 };
 
 std::unique_ptr<AudioSystem> SwitchAudioSystem::Create(
@@ -481,21 +499,76 @@ void SwitchAudioSystem::FillAndAppend(size_t buffer_index) {
   // How much the mix saturates before it is clipped (the crackling in handheld mode). Counting only.
   float pico = 0.0f;
   uint32_t saturated = 0;
+  uint32_t concealed_blocks = 0;
   if (REXCVAR_GET(audio_mute)) {
     std::memset(samples, 0, kBufferBytes);
     output.gap_concealer.Reset();
+    output.diag_seen_active = false;
+    output.diag_current_silent_run = 0;
   } else {
-    for (size_t i = 0; i < output.mix.size(); ++i) {
-      const float value = std::isfinite(output.mix[i]) ? output.mix[i] : 0.0f;
-      const float magnitude = std::fabs(value);
-      pico = std::max(pico, magnitude);
-      saturated += magnitude > 1.0f ? 1 : 0;
-      samples[i] = static_cast<s16>(std::lrint(std::clamp(value, -1.0f, 1.0f) * 32767.0f));
-      pcm_nonzero |= samples[i] != 0;
+    constexpr size_t kBlockStereoSamples = SwitchAudioDriver::kChannelSamples * 2;
+    for (uint32_t frame = 0; frame < kFramesPerBuffer; ++frame) {
+      const size_t base = size_t(frame) * kBlockStereoSamples;
+      bool block_nonzero = false;
+      for (size_t j = 0; j < kBlockStereoSamples; ++j) {
+        const size_t i = base + j;
+        const float value = std::isfinite(output.mix[i]) ? output.mix[i] : 0.0f;
+        const float magnitude = std::fabs(value);
+        pico = std::max(pico, magnitude);
+        saturated += magnitude > 1.0f ? 1 : 0;
+        const s16 s = static_cast<s16>(std::lrint(std::clamp(value, -1.0f, 1.0f) * 32767.0f));
+        samples[i] = s;
+        block_nonzero |= s != 0;
+      }
+      pcm_nonzero |= block_nonzero;
+      if (block_nonzero) {
+        if (output.diag_seen_active && output.diag_current_silent_run > 0) {
+          // A silent run bounded on both sides by active PCM: count short runs (<= 16 blocks / 85 ms)
+          // as mid-audio dropouts (longer runs are genuine scene/menu silences).
+          if (output.diag_current_silent_run <= 16) {
+            ++output.diag_dropouts_raw;
+            output.diag_dropout_blocks_raw += output.diag_current_silent_run;
+            output.diag_max_dropout_run =
+                std::max(output.diag_max_dropout_run, output.diag_current_silent_run);
+          }
+        }
+        output.diag_seen_active = true;
+        output.diag_current_silent_run = 0;
+      } else {
+        ++output.diag_silent_raw;
+        if (output.diag_seen_active) {
+          ++output.diag_current_silent_run;
+        }
+      }
     }
     if (output.conceal_gaps) {
-      pcm_nonzero = output.gap_concealer.Process(samples);
+      pcm_nonzero = output.gap_concealer.Process(samples, &concealed_blocks);
     }
+  }
+  output.diag_mixed += frames_mixed;
+  output.diag_missing += frames_missing;
+  output.diag_concealed += concealed_blocks;
+  const u64 now_tick = armGetSystemTick();
+  if (output.diag_last_report_tick == 0) {
+    output.diag_last_report_tick = now_tick;
+  } else if (armTicksToNs(now_tick - output.diag_last_report_tick) >= 10'000'000'000ull) {
+    const double secs = double(armTicksToNs(now_tick - output.diag_last_report_tick)) / 1e9;
+    const uint32_t q_min = output.diag_q_min == UINT32_MAX ? 0 : output.diag_q_min;
+    REXLOG_INFO("[audio] {:.1f} s: mixed {} blocks, underruns {}, raw silent {}, mid-audio dropouts {} "
+                "({} blocks, max run {}), concealed {}, queue {}-{}",
+                secs, output.diag_mixed, output.diag_missing, output.diag_silent_raw,
+                output.diag_dropouts_raw, output.diag_dropout_blocks_raw, output.diag_max_dropout_run,
+                output.diag_concealed, q_min, output.diag_q_max);
+    output.diag_last_report_tick = now_tick;
+    output.diag_mixed = 0;
+    output.diag_missing = 0;
+    output.diag_silent_raw = 0;
+    output.diag_dropouts_raw = 0;
+    output.diag_dropout_blocks_raw = 0;
+    output.diag_max_dropout_run = 0;
+    output.diag_concealed = 0;
+    output.diag_q_min = UINT32_MAX;
+    output.diag_q_max = 0;
   }
   DumpOutput(samples, output.mix.size());
   RexSwitchPerfAdd(21, saturated);
@@ -519,6 +592,9 @@ void SwitchAudioSystem::PumpTick() {
   std::lock_guard<std::mutex> guard(drivers_mutex_);
   for (SwitchAudioDriver* driver : drivers_) {
     const size_t queued = driver->QueuedFrames();
+    const uint32_t q32 = static_cast<uint32_t>(queued);
+    output_->diag_q_min = std::min(output_->diag_q_min, q32);
+    output_->diag_q_max = std::max(output_->diag_q_max, q32);
     if (queued <= output_->frames_in_queue) {
       driver->RequestFrame();
     }
@@ -533,7 +609,7 @@ void SwitchAudioSystem::OutputThreadMain() {
   for (size_t i = 0; i < kBufferCount; ++i) {
     FillAndAppend(i);
   }
-  const u64 interval = armNsToTicks(kPumpIntervalNs);
+  const u64 interval = armGetSystemTickFreq() * SwitchAudioDriver::kChannelSamples / 48000;
   u64 deadline = armGetSystemTick() + interval;
   while (output.running.load(std::memory_order_relaxed)) {
     u64 timeout_ns = kWaitTimeoutNs;

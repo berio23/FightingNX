@@ -507,6 +507,7 @@ bool DrawBlendConstant(const d3d::Device &dev, const PipelineKey &key, float rgb
 }
 
 std::vector<u32> g_indices;  // scratch for index reads
+std::vector<u16> g_indices16;  // compact scratch for non-expanded 16-bit index reads
 
 // SetTilesLocked / SetReplayPredicationLocked.
 std::vector<ClearRect> g_tiles;
@@ -878,18 +879,23 @@ uint32_t g_card_sample_count;
 bool LogLimited(uint32_t &counter, uint32_t limit);
 
 // The cards: the guest window's first MB (rex::memory::g_store_cards, a runtime variable this file cannot link to on
-// Windows, where the runtime is a DLL).
-u8 *StoreCards() {
-  static u8 *const cards = REX_KERNEL_MEMORY()->virtual_membase();
-  return cards;
+// Windows, where the runtime is a DLL). Cached in plain pointers (render thread only) to avoid per-call guard loads.
+u8 *g_store_cards_cached = nullptr;
+const u8 *g_physical_cached = nullptr;
+
+inline u8 *StoreCards() {
+  if (!g_store_cards_cached) [[unlikely]]
+    g_store_cards_cached = REX_KERNEL_MEMORY()->virtual_membase();
+  return g_store_cards_cached;
 }
 
 // The physical address of the guest memory at 'data' (a pointer into the raw physical view, or into the guest window at
 // a guest address of one of the views of physical memory: a vertex or index buffer's CPU address, where the game wrote
 // it), or UINT32_MAX for anything else.
 u32 PhysicalOf(const u8 *data) {
-  static const u8 *const physical = GuestPhysicalPtr<const u8>(0);
-  const uintptr_t raw = uintptr_t(data) - uintptr_t(physical);
+  if (!g_physical_cached) [[unlikely]]
+    g_physical_cached = GuestPhysicalPtr<const u8>(0);
+  const uintptr_t raw = uintptr_t(data) - uintptr_t(g_physical_cached);
   if (raw < 0x20000000u)
     return u32(raw);
   const uint64_t window = uint64_t(uintptr_t(data) - uintptr_t(StoreCards()));
@@ -915,29 +921,93 @@ bool PagesClean(const u8 *data, size_t bytes, uint64_t proven) {
     return false;
   }
   const u32 serial = u32(g_flush_serial);
+  const u32 proven32 = u32(proven);
   const u32 last = u32((uint64_t(offset) + bytes - 1) >> 12);
   u32 page = offset >> 12;
   page -= page != 0;
   bool clean = true;
+  if (!diag) [[likely]] {
+    // Low 16 MB (< 0x1000 pages): includes the 0x7F000000 alias view and page 0.
+    while (page <= last && page < 0x1000u) {
+      u8 *a = cards + 0xA0000u + page, *c = cards + 0xC0000u + page;
+      u8 *e = page ? cards + 0xE0000u + page - 1 : a, *f = cards + 0x7F000u + page;
+      if (!__atomic_load_n(a, __ATOMIC_RELAXED) || !__atomic_load_n(c, __ATOMIC_RELAXED) ||
+          !__atomic_load_n(e, __ATOMIC_RELAXED) || !__atomic_load_n(f, __ATOMIC_RELAXED)) {
+        __atomic_store_n(a, u8(1), __ATOMIC_RELAXED);
+        __atomic_store_n(c, u8(1), __ATOMIC_RELAXED);
+        __atomic_store_n(e, u8(1), __ATOMIC_RELAXED);
+        __atomic_store_n(f, u8(1), __ATOMIC_RELAXED);
+        g_page_serial[page] = serial;
+      }
+      if (g_page_serial[page] >= proven32)
+        clean = false;
+      ++page;
+    }
+    // >= 0x1000 pages (>95% of checks): only 3 views (0xA0000, 0xC0000, 0xE0000 - 1).
+#if defined(__aarch64__)
+    while (page + 16u <= last + 1u) {
+      u8 *a = cards + 0xA0000u + page;
+      u8 *c = cards + 0xC0000u + page;
+      u8 *e = cards + 0xE0000u + page - 1;
+      const uint8x16_t m = vminq_u8(vminq_u8(vld1q_u8(a), vld1q_u8(c)), vld1q_u8(e));
+      if (vminvq_u8(m) != 0) {
+        if (clean) {
+          const uint32x4_t s0 = vld1q_u32(g_page_serial + page);
+          const uint32x4_t s1 = vld1q_u32(g_page_serial + page + 4);
+          const uint32x4_t s2 = vld1q_u32(g_page_serial + page + 8);
+          const uint32x4_t s3 = vld1q_u32(g_page_serial + page + 12);
+          const uint32x4_t mx = vmaxq_u32(vmaxq_u32(s0, s1), vmaxq_u32(s2, s3));
+          if (vmaxvq_u32(mx) >= proven32)
+            clean = false;
+        }
+        page += 16u;
+        continue;
+      }
+      for (u32 end = page + 16u; page < end; ++page) {
+        u8 *pa = cards + 0xA0000u + page, *pc = cards + 0xC0000u + page, *pe = cards + 0xE0000u + page - 1;
+        if (!__atomic_load_n(pa, __ATOMIC_RELAXED) || !__atomic_load_n(pc, __ATOMIC_RELAXED) ||
+            !__atomic_load_n(pe, __ATOMIC_RELAXED)) {
+          __atomic_store_n(pa, u8(1), __ATOMIC_RELAXED);
+          __atomic_store_n(pc, u8(1), __ATOMIC_RELAXED);
+          __atomic_store_n(pe, u8(1), __ATOMIC_RELAXED);
+          g_page_serial[page] = serial;
+        }
+        if (g_page_serial[page] >= proven32)
+          clean = false;
+      }
+    }
+#endif
+    for (; page <= last; ++page) {
+      u8 *a = cards + 0xA0000u + page, *c = cards + 0xC0000u + page, *e = cards + 0xE0000u + page - 1;
+      if (!__atomic_load_n(a, __ATOMIC_RELAXED) || !__atomic_load_n(c, __ATOMIC_RELAXED) ||
+          !__atomic_load_n(e, __ATOMIC_RELAXED)) {
+        __atomic_store_n(a, u8(1), __ATOMIC_RELAXED);
+        __atomic_store_n(c, u8(1), __ATOMIC_RELAXED);
+        __atomic_store_n(e, u8(1), __ATOMIC_RELAXED);
+        g_page_serial[page] = serial;
+      }
+      if (g_page_serial[page] >= proven32)
+        clean = false;
+    }
+    return clean;
+  }
   const u32 own_first = offset >> 12;
   bool own_written = false;
   for (; page <= last; ++page) {
     u8 *a = cards + 0xA0000u + page, *c = cards + 0xC0000u + page;
     u8 *e = page ? cards + 0xE0000u + page - 1 : a, *f = page < 0x1000u ? cards + 0x7F000u + page : a;
-    if (diag) {
-      ++g_card_diag[0];
-      const bool va = !*a, vc = !*c, ve = !*e, vf = !*f;
-      if (va || vc || ve || vf) {
-        ++g_card_diag[1];
-        g_card_diag[2] += va;
-        g_card_diag[3] += vc;
-        g_card_diag[4] += ve;
-        g_card_diag[5] += vf;
-        own_written |= page >= own_first;
-        if (g_card_sample_count < 8)
-          g_card_samples[g_card_sample_count++] = page | (va ? 1u << 28 : 0) | (vc ? 1u << 29 : 0) |
-                                                  (ve ? 1u << 30 : 0) | (vf ? 1u << 31 : 0);
-      }
+    ++g_card_diag[0];
+    const bool va = !*a, vc = !*c, ve = !*e, vf = !*f;
+    if (va || vc || ve || vf) {
+      ++g_card_diag[1];
+      g_card_diag[2] += va;
+      g_card_diag[3] += vc;
+      g_card_diag[4] += ve;
+      g_card_diag[5] += vf;
+      own_written |= page >= own_first;
+      if (g_card_sample_count < 8)
+        g_card_samples[g_card_sample_count++] = page | (va ? 1u << 28 : 0) | (vc ? 1u << 29 : 0) |
+                                                (ve ? 1u << 30 : 0) | (vf ? 1u << 31 : 0);
     }
     if (!__atomic_load_n(a, __ATOMIC_RELAXED) || !__atomic_load_n(c, __ATOMIC_RELAXED) ||
         !__atomic_load_n(e, __ATOMIC_RELAXED) || !__atomic_load_n(f, __ATOMIC_RELAXED)) {
@@ -947,10 +1017,10 @@ bool PagesClean(const u8 *data, size_t bytes, uint64_t proven) {
       __atomic_store_n(f, u8(1), __ATOMIC_RELAXED);
       g_page_serial[page] = serial;
     }
-    if (g_page_serial[page] >= u32(proven))
+    if (g_page_serial[page] >= proven32)
       clean = false;
   }
-  if (diag && !clean && !own_written && own_first != 0 && g_page_serial[own_first - 1] >= u32(proven))
+  if (!clean && !own_written && own_first != 0 && g_page_serial[own_first - 1] >= proven32)
     ++g_card_diag[6];
   return clean;
 }
@@ -2312,9 +2382,181 @@ bool CachedIndexDraw(const IndexKey &key, const DrawCall &call, Geometry &g) {
   return true;
 }
 
-// After a draw read the range into g_indices: count how long it has held, and
+// Fused read + byte-swap + min/max for non-expanded indexed draws, avoiding a separate pass over g_indices.
+bool ReadIndices16MinMax(const u8 *src, u32 count, u32 endian, u32 &lo_out, u32 &hi_out) {
+  if (!src || !count || count > kMaxDrawIndices)
+    return false;
+  g_indices16.resize(count);
+  u16 *dst = g_indices16.data();
+  const bool swap = endian == 1 || endian == 2;
+  u16 lo = 0xFFFFu, hi = 0u;
+  u32 i = 0;
+#if defined(__aarch64__)
+  if (count >= 16) {
+    uint16x8_t vlo = vdupq_n_u16(0xFFFFu);
+    uint16x8_t vhi = vdupq_n_u16(0u);
+    if (swap) {
+      for (; i + 16 <= count; i += 16) {
+        const uint16x8_t a = vreinterpretq_u16_u8(vrev16q_u8(vld1q_u8(src + i * 2)));
+        const uint16x8_t b = vreinterpretq_u16_u8(vrev16q_u8(vld1q_u8(src + i * 2 + 16)));
+        vst1q_u16(dst + i, a);
+        vst1q_u16(dst + i + 8, b);
+        vlo = vminq_u16(vlo, vminq_u16(a, b));
+        vhi = vmaxq_u16(vhi, vmaxq_u16(a, b));
+      }
+      for (; i + 8 <= count; i += 8) {
+        const uint16x8_t a = vreinterpretq_u16_u8(vrev16q_u8(vld1q_u8(src + i * 2)));
+        vst1q_u16(dst + i, a);
+        vlo = vminq_u16(vlo, a);
+        vhi = vmaxq_u16(vhi, a);
+      }
+    } else {
+      for (; i + 16 <= count; i += 16) {
+        const uint16x8_t a = vreinterpretq_u16_u8(vld1q_u8(src + i * 2));
+        const uint16x8_t b = vreinterpretq_u16_u8(vld1q_u8(src + i * 2 + 16));
+        vst1q_u16(dst + i, a);
+        vst1q_u16(dst + i + 8, b);
+        vlo = vminq_u16(vlo, vminq_u16(a, b));
+        vhi = vmaxq_u16(vhi, vmaxq_u16(a, b));
+      }
+      for (; i + 8 <= count; i += 8) {
+        const uint16x8_t a = vreinterpretq_u16_u8(vld1q_u8(src + i * 2));
+        vst1q_u16(dst + i, a);
+        vlo = vminq_u16(vlo, a);
+        vhi = vmaxq_u16(vhi, a);
+      }
+    }
+    lo = vminvq_u16(vlo);
+    hi = vmaxvq_u16(vhi);
+  }
+#endif
+  for (; i < count; ++i) {
+    u16 v;
+    std::memcpy(&v, src + i * 2, 2);
+    if (swap)
+      v = u16((v >> 8) | (v << 8));
+    dst[i] = v;
+    lo = std::min(lo, v);
+    hi = std::max(hi, v);
+  }
+  lo_out = lo;
+  hi_out = hi;
+  return true;
+}
+
+bool ReadIndices32MinMax(const u8 *src, u32 count, u32 endian, u32 &lo_out, u32 &hi_out) {
+  if (!src || !count || count > kMaxDrawIndices)
+    return false;
+  g_indices.resize(count);
+  u32 *dst = g_indices.data();
+  u32 lo = UINT32_MAX, hi = 0u;
+  u32 i = 0;
+  const u32 e = endian & 3u;
+#if defined(__aarch64__)
+  if (count >= 8) {
+    uint32x4_t vlo = vdupq_n_u32(UINT32_MAX);
+    uint32x4_t vhi = vdupq_n_u32(0u);
+    auto swap_vec = [e](uint8x16_t raw) -> uint32x4_t {
+      if (e == 2)
+        return vreinterpretq_u32_u8(vrev32q_u8(raw));
+      if (e == 1)
+        return vreinterpretq_u32_u8(vrev16q_u8(raw));
+      if (e == 3)
+        return vreinterpretq_u32_u16(vrev32q_u16(vreinterpretq_u16_u8(raw)));
+      return vreinterpretq_u32_u8(raw);
+    };
+    for (; i + 8 <= count; i += 8) {
+      const uint32x4_t a = swap_vec(vld1q_u8(src + i * 4));
+      const uint32x4_t b = swap_vec(vld1q_u8(src + i * 4 + 16));
+      vst1q_u32(dst + i, a);
+      vst1q_u32(dst + i + 4, b);
+      vlo = vminq_u32(vlo, vminq_u32(a, b));
+      vhi = vmaxq_u32(vhi, vmaxq_u32(a, b));
+    }
+    for (; i + 4 <= count; i += 4) {
+      const uint32x4_t a = swap_vec(vld1q_u8(src + i * 4));
+      vst1q_u32(dst + i, a);
+      vlo = vminq_u32(vlo, a);
+      vhi = vmaxq_u32(vhi, a);
+    }
+    lo = vminvq_u32(vlo);
+    hi = vmaxvq_u32(vhi);
+  }
+#endif
+  for (; i < count; ++i) {
+    u32 v;
+    std::memcpy(&v, src + i * 4, 4);
+    if (e == 2)
+      v = __builtin_bswap32(v);
+    else if (e == 1)
+      v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+    else if (e == 3)
+      v = (v >> 16) | (v << 16);
+    dst[i] = v;
+    lo = std::min(lo, v);
+    hi = std::max(hi, v);
+  }
+  lo_out = lo;
+  hi_out = hi;
+  return true;
+}
+
+void RebaseIndices16ToHost(const u16 *in, size_t count, u32 lo, bool wide, void *dst) {
+  if (wide) {
+    auto *out = static_cast<u32 *>(dst);
+    for (size_t i = 0; i < count; ++i)
+      out[i] = u32(in[i]) - lo;
+    return;
+  }
+  auto *out = static_cast<uint16_t *>(dst);
+  size_t i = 0;
+#if defined(__aarch64__)
+  const uint16x8_t vbase = vdupq_n_u16(u16(lo));
+  for (; i + 16 <= count; i += 16) {
+    vst1q_u16(out + i, vsubq_u16(vld1q_u16(in + i), vbase));
+    vst1q_u16(out + i + 8, vsubq_u16(vld1q_u16(in + i + 8), vbase));
+  }
+  for (; i + 8 <= count; i += 8)
+    vst1q_u16(out + i, vsubq_u16(vld1q_u16(in + i), vbase));
+#endif
+  for (; i < count; ++i)
+    out[i] = uint16_t(in[i] - u16(lo));
+}
+
+void RebaseIndices32ToHost(const u32 *in, size_t count, u32 lo, bool wide, void *dst) {
+  if (wide) {
+    auto *out = static_cast<u32 *>(dst);
+    size_t i = 0;
+#if defined(__aarch64__)
+    const uint32x4_t vbase = vdupq_n_u32(lo);
+    for (; i + 8 <= count; i += 8) {
+      vst1q_u32(out + i, vsubq_u32(vld1q_u32(in + i), vbase));
+      vst1q_u32(out + i + 4, vsubq_u32(vld1q_u32(in + i + 4), vbase));
+    }
+    for (; i + 4 <= count; i += 4)
+      vst1q_u32(out + i, vsubq_u32(vld1q_u32(in + i), vbase));
+#endif
+    for (; i < count; ++i)
+      out[i] = in[i] - lo;
+    return;
+  }
+  auto *out = static_cast<uint16_t *>(dst);
+  size_t i = 0;
+#if defined(__aarch64__)
+  const uint32x4_t vbase = vdupq_n_u32(lo);
+  for (; i + 8 <= count; i += 8) {
+    const uint16x4_t a = vmovn_u32(vsubq_u32(vld1q_u32(in + i), vbase));
+    const uint16x4_t b = vmovn_u32(vsubq_u32(vld1q_u32(in + i + 4), vbase));
+    vst1q_u16(out + i, vcombine_u16(a, b));
+  }
+#endif
+  for (; i < count; ++i)
+    out[i] = uint16_t(in[i] - lo);
+}
+
+// After a draw read the range into g_indices (or g_indices16 when from16): count how long it has held, and
 // give a range that has held long enough its persistent copy.
-void TrackIndices(const IndexKey &key, u32 lo, u32 max_index) {
+void TrackIndices(const IndexKey &key, u32 lo, u32 max_index, bool from16 = false) {
   CachedIndices &c = g_index_memo.Get(g_index_cache, key, true)->second;
   c.last_used = g_stream_cache_frame;
   if (c.dynamic || c.copy || c.checked_frame == g_stream_cache_frame)
@@ -2323,26 +2565,22 @@ void TrackIndices(const IndexKey &key, u32 lo, u32 max_index) {
   const uint64_t hash = HashIndices(key);
   c.stable = hash == c.hash ? c.stable + 1 : 0;
   c.hash = hash;
+  const size_t idx_count = from16 ? g_indices16.size() : g_indices.size();
   const bool wide = max_index > 0xFFFE;
-  const u32 bytes = u32(g_indices.size()) * (wide ? 4 : 2);
+  const u32 bytes = u32(idx_count) * (wide ? 4 : 2);
   if (c.stable + 1 < kStableFlushes ||
       g_stream_cache_bytes + bytes > banjo::renut_gpu::StreamCacheMaxBytes(kStreamCacheMaxBytes))  // banjo-nx
     return;
   const PoolSpan copy = g_copy_pool.Allocate(bytes);
   if (!copy)
     return;
-  if (wide) {
-    auto *out = reinterpret_cast<u32 *>(copy.cpu);
-    for (size_t i = 0; i < g_indices.size(); ++i)
-      out[i] = g_indices[i] - lo;
-  } else {
-    auto *out = reinterpret_cast<uint16_t *>(copy.cpu);
-    for (size_t i = 0; i < g_indices.size(); ++i)
-      out[i] = uint16_t(g_indices[i] - lo);
-  }
+  if (from16)
+    RebaseIndices16ToHost(g_indices16.data(), idx_count, lo, wide, copy.cpu);
+  else
+    RebaseIndices32ToHost(g_indices.data(), idx_count, lo, wide, copy.cpu);
   c.copy = copy;
   c.bytes = bytes;
-  c.index_count = u32(g_indices.size());
+  c.index_count = u32(idx_count);
   c.lo = lo;
   c.max_index = max_index;
   c.wide = wide;
@@ -2355,9 +2593,10 @@ bool PrepareGeometry(const GuestDevice &device, const DrawCall &call, Geometry &
   if (call.primitive == kRectangleList && !State().rectangle_list_gs && LogLimited(rect_logged, 1))
     RGPU_WARN("Rectangle lists are drawn as triangle lists");
 
-  u32 lo = 0, max_index = 0;  // host indices are g_indices - lo, the largest max_index
+  u32 lo = 0, max_index = 0;  // host indices are indices - lo, the largest max_index
   IndexKey index_key{};
   bool cacheable_indices = false;
+  bool from16 = false;
   if (call.indexed) {
     const u8 *src = nullptr;
     bool is32 = false;
@@ -2384,17 +2623,27 @@ bool PrepareGeometry(const GuestDevice &device, const DrawCall &call, Geometry &
       if (cacheable_indices && CachedIndexDraw(index_key, call, g))
         return true;
     }
-    if (!ReadIndices(src, call.count, is32, endian))
-      return false;
-    if (expand)
-      ExpandIndices(call.primitive);
-    if (g_indices.empty())
-      return false;
-    lo = UINT32_MAX;
     u32 hi = 0;
-    for (u32 index : g_indices) {
-      lo = std::min(lo, index);
-      hi = std::max(hi, index);
+    if (!expand) {
+      if (is32) {
+        if (!ReadIndices32MinMax(src, call.count, endian, lo, hi))
+          return false;
+      } else {
+        if (!ReadIndices16MinMax(src, call.count, endian, lo, hi))
+          return false;
+        from16 = true;
+      }
+    } else {
+      if (!ReadIndices(src, call.count, is32, endian))
+        return false;
+      ExpandIndices(call.primitive);
+      if (g_indices.empty())
+        return false;
+      lo = UINT32_MAX;
+      for (u32 index : g_indices) {
+        lo = std::min(lo, index);
+        hi = std::max(hi, index);
+      }
     }
     if (hi - lo >= kMaxDrawVertices)
       return false;
@@ -2425,26 +2674,22 @@ bool PrepareGeometry(const GuestDevice &device, const DrawCall &call, Geometry &
     // vertex index includes it), and vertex shaders that fetch by address
     // take the guest index from the vertex ID (renutVertexRegisters).
     // 16-bit when every index fits, like the guest's own format mostly is.
+    const size_t idx_count = from16 ? g_indices16.size() : g_indices.size();
     const bool wide = max_index > 0xFFFE;
-    const u32 bytes = u32(g_indices.size()) * (wide ? 4 : 2);
+    const u32 bytes = u32(idx_count) * (wide ? 4 : 2);
     UploadAllocation alloc = Video::UploadsLocked().Allocate(bytes, 16);
     if (!alloc)
       return false;
-    if (wide) {
-      auto *out = static_cast<u32 *>(alloc.cpu);
-      for (size_t i = 0; i < g_indices.size(); ++i)
-        out[i] = g_indices[i] - lo;
-    } else {
-      auto *out = static_cast<uint16_t *>(alloc.cpu);
-      for (size_t i = 0; i < g_indices.size(); ++i)
-        out[i] = uint16_t(g_indices[i] - lo);
-    }
+    if (from16)
+      RebaseIndices16ToHost(g_indices16.data(), idx_count, lo, wide, alloc.cpu);
+    else
+      RebaseIndices32ToHost(g_indices.data(), idx_count, lo, wide, alloc.cpu);
     g.indexed = true;
-    g.index_count = u32(g_indices.size());
+    g.index_count = u32(idx_count);
     g.index_view = plume::RenderIndexBufferView(
         alloc.ref, bytes, wide ? plume::RenderFormat::R32_UINT : plume::RenderFormat::R16_UINT);
     if (cacheable_indices)
-      TrackIndices(index_key, lo, max_index);
+      TrackIndices(index_key, lo, max_index, from16);
   }
   return true;
 }

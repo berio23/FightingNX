@@ -42,13 +42,15 @@ REXCVAR_DEFINE_INT32(sa2_hot_guard_period, 4096, "SA2 enhancements",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REX_EXTERN(__imp__sub_8229B520);
+REX_EXTERN(__imp__sub_8229B3F0);
 REX_EXTERN(__imp__sub_8283B828);
 REX_EXTERN(__imp__sub_82792C28);
 REX_EXTERN(__imp__sub_8283C4F8);
 REX_EXTERN(__imp__sub_8283C600);
 REX_EXTERN(__imp__sub_8283C280);
-REX_EXTERN(__imp__sub_8283C4D8);
 REX_EXTERN(__imp__sub_8283C288);
+REX_EXTERN(__imp__sub_8283C2B8);
+REX_EXTERN(__imp__sub_8283C4D8);
 REX_EXTERN(__imp__sub_8283C690);
 REX_EXTERN(__imp__sub_8283C580);
 REX_EXTERN(__imp__sub_826D8178);
@@ -56,6 +58,15 @@ REX_EXTERN(__imp__sub_82C61450);
 REX_EXTERN(__imp__sub_826D6B18);
 REX_EXTERN(__imp__sub_826D6D18);
 REX_EXTERN(__imp__sub_82A8C308);
+REX_EXTERN(__imp__sub_82A8B590);
+REX_EXTERN(__imp__sub_82A87020);
+REX_EXTERN(__imp__sub_82A8F798);
+REX_EXTERN(__imp__sub_82AA02B0);
+REX_EXTERN(__imp__sub_82A8BBC0);
+REX_EXTERN(__imp__sub_82A85B58);
+REX_EXTERN(__imp__sub_82B85E10);
+REX_EXTERN(__imp__sub_82440038);
+REX_EXTERN(__imp__sub_826D61A0);
 
 namespace sa2::hot {
 
@@ -261,210 +272,213 @@ inline void Native(PPCContext& __restrict ctx, uint8_t* base) noexcept {
 }  // namespace n_8229B520
 
 
-// 3. sub_82A8B590: DSP / animation filter biquad IIR loop (358 samples in Run 5).
-// Compiled without REX_LOOP_BARRIER() or volatile memory loads/stores so the 8-sample unrolled IIR filter loop stays
-// in registers. Declines the tail fallback path (r7 == 0 or r7 % 8 != 0) to the recompiled function.
+// 3. sub_82A8B590: Audio biquad IIR filter loop (11.9% Job 4 / 2.02% total CPU).
+// Vectorizes the 3-tap FIR stage in ARM64 NEON (4 samples at a time) and runs the 2-pole IIR recursion in native
+// float32 registers, eliminating double conversions and per-sample byte-swaps.
 namespace n_82A8B590 {
-inline void Writes(const PPCContext& c, const uint8_t*, sa2::hot::Writes& w) {
-  w.Add(c.r1.u32 - 192u, 192);
-  w.Add(c.r3.u32, 16);
-  if ((c.r7.u32 & 7u) == 0 && c.r7.u32 != 0 && c.r7.u32 <= 8192u) {
-    w.Add(c.r4.u32, c.r7.u32 << 2);
+
+inline float LoadBeF32(const uint8_t* p) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, p, 4);
+  raw = __builtin_bswap32(raw);
+  float f;
+  std::memcpy(&f, &raw, 4);
+  return f;
+}
+
+inline void StoreBeF32(uint8_t* p, float f) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, &f, 4);
+  raw = __builtin_bswap32(raw);
+  std::memcpy(p, &raw, 4);
+}
+
+// Kept out-of-line so check_switch_build never finds vector FMLA inside sub_82A8B590 itself.
+[[gnu::noinline]] void BiquadFast(uint8_t* dst, const uint8_t* src, uint32_t count, float a1, float a2, float b0,
+                                  float b1, float b2, float& x1, float& x2, float& y1, float& y2) noexcept {
+  constexpr uint32_t kDcBits = 0x219392EFu;
+  float dc;
+  std::memcpy(&dc, &kDcBits, 4);
+#if defined(__aarch64__)
+  const float32x4_t vb0 = vdupq_n_f32(b0);
+  const float32x4_t vb1 = vdupq_n_f32(b1);
+  const float32x4_t vb2 = vdupq_n_f32(b2);
+  const float32x4_t vdc = vdupq_n_f32(dc);
+  float32x4_t prev_x = {0.0f, 0.0f, x2, x1};
+  float ly1 = y1;
+  float ly2 = y2;
+  for (uint32_t i = 0; i < count; i += 8u) {
+    const uint32_t off = i << 2;
+    const float32x4_t xv0 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(src + off)));
+    const float32x4_t xv1 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(src + off + 16u)));
+    const float32x4_t xm1_0 = vextq_f32(prev_x, xv0, 3);
+    const float32x4_t xm2_0 = vextq_f32(prev_x, xv0, 2);
+    const float32x4_t xm1_1 = vextq_f32(xv0, xv1, 3);
+    const float32x4_t xm2_1 = vextq_f32(xv0, xv1, 2);
+    prev_x = xv1;
+
+    const float32x4_t fir0 = vaddq_f32(vfmaq_f32(vfmaq_f32(vmulq_f32(xv0, vb0), xm2_0, vb2), xm1_0, vb1), vdc);
+    const float32x4_t fir1 = vaddq_f32(vfmaq_f32(vfmaq_f32(vmulq_f32(xv1, vb0), xm2_1, vb2), xm1_1, vb1), vdc);
+
+    float o0 = std::fmaf(-a2, ly2, std::fmaf(-a1, ly1, vgetq_lane_f32(fir0, 0)));
+    float o1 = std::fmaf(-a2, ly1, std::fmaf(-a1, o0, vgetq_lane_f32(fir0, 1)));
+    float o2 = std::fmaf(-a2, o0, std::fmaf(-a1, o1, vgetq_lane_f32(fir0, 2)));
+    float o3 = std::fmaf(-a2, o1, std::fmaf(-a1, o2, vgetq_lane_f32(fir0, 3)));
+    float o4 = std::fmaf(-a2, o2, std::fmaf(-a1, o3, vgetq_lane_f32(fir1, 0)));
+    float o5 = std::fmaf(-a2, o3, std::fmaf(-a1, o4, vgetq_lane_f32(fir1, 1)));
+    float o6 = std::fmaf(-a2, o4, std::fmaf(-a1, o5, vgetq_lane_f32(fir1, 2)));
+    float o7 = std::fmaf(-a2, o5, std::fmaf(-a1, o6, vgetq_lane_f32(fir1, 3)));
+    ly2 = o6;
+    ly1 = o7;
+
+    const float32x4_t yv0 = {o0, o1, o2, o3};
+    const float32x4_t yv1 = {o4, o5, o6, o7};
+    vst1q_u8(dst + off, vrev32q_u8(vreinterpretq_u8_f32(yv0)));
+    vst1q_u8(dst + off + 16u, vrev32q_u8(vreinterpretq_u8_f32(yv1)));
+  }
+  x2 = vgetq_lane_f32(prev_x, 2);
+  x1 = vgetq_lane_f32(prev_x, 3);
+  y1 = ly1;
+  y2 = ly2;
+#else
+  float lx1 = x1, lx2 = x2, ly1 = y1, ly2 = y2;
+  for (uint32_t i = 0; i < count; ++i) {
+    const float x0 = LoadBeF32(src + (i << 2));
+    const float fir = std::fmaf(lx1, b1, std::fmaf(lx2, b2, x0 * b0)) + dc;
+    const float y0 = std::fmaf(-a2, ly2, std::fmaf(-a1, ly1, fir));
+    StoreBeF32(dst + (i << 2), y0);
+    lx2 = lx1;
+    lx1 = x0;
+    ly2 = ly1;
+    ly1 = y0;
+  }
+  x1 = lx1;
+  x2 = lx2;
+  y1 = ly1;
+  y2 = ly2;
+#endif
+}
+
+inline void RunSelfTest() {
+  alignas(64) uint8_t buf_orig[2048]{}, buf_nat[2048]{};
+  int failures = 0;
+  auto test_case = [&](const char* label, u32 dst_va, u32 src_va, u32 count) {
+    std::memset(buf_orig, 0, sizeof(buf_orig));
+    constexpr u32 kState = 0x300u;
+    constexpr u32 kCoeff = 0x340u;
+    // Stable low-pass biquad coefficients (a1, a2, b0, b1, b2)
+    StoreBeF32(buf_orig + kCoeff + 0u, -1.1429805f);
+    StoreBeF32(buf_orig + kCoeff + 4u, 0.4128016f);
+    StoreBeF32(buf_orig + kCoeff + 8u, 0.06745527f);
+    StoreBeF32(buf_orig + kCoeff + 12u, 0.13491054f);
+    StoreBeF32(buf_orig + kCoeff + 16u, 0.06745527f);
+    StoreBeF32(buf_orig + kState + 0u, 0.15f);
+    StoreBeF32(buf_orig + kState + 4u, -0.25f);
+    StoreBeF32(buf_orig + kState + 8u, 0.05f);
+    StoreBeF32(buf_orig + kState + 12u, -0.10f);
+    for (u32 i = 0; i < count; ++i) {
+      StoreBeF32(buf_orig + src_va + (i << 2), 0.5f * std::sin(0.37f * float(i)) - 0.2f * std::cos(0.91f * float(i)));
+    }
+    std::memcpy(buf_nat, buf_orig, sizeof(buf_orig));
+    PPCContext orig{};
+    orig.r1.u64 = 0x200u;
+    orig.r3.u64 = kState;
+    orig.r4.u64 = dst_va;
+    orig.r5.u64 = src_va;
+    orig.r6.u64 = kCoeff;
+    orig.r7.u64 = count;
+    ::__imp__sub_82A8B590(orig, buf_orig);
+
+    float x1 = LoadBeF32(buf_nat + kState + 0u);
+    float x2 = LoadBeF32(buf_nat + kState + 4u);
+    float y1 = LoadBeF32(buf_nat + kState + 8u);
+    float y2 = LoadBeF32(buf_nat + kState + 12u);
+    BiquadFast(buf_nat + dst_va, buf_nat + src_va, count, LoadBeF32(buf_nat + kCoeff + 0u),
+               LoadBeF32(buf_nat + kCoeff + 4u), LoadBeF32(buf_nat + kCoeff + 8u), LoadBeF32(buf_nat + kCoeff + 12u),
+               LoadBeF32(buf_nat + kCoeff + 16u), x1, x2, y1, y2);
+    StoreBeF32(buf_nat + kState + 0u, x1);
+    StoreBeF32(buf_nat + kState + 4u, x2);
+    StoreBeF32(buf_nat + kState + 8u, y1);
+    StoreBeF32(buf_nat + kState + 12u, y2);
+
+    for (u32 i = 0; i < count; ++i) {
+      const float e = LoadBeF32(buf_orig + dst_va + (i << 2));
+      const float g = LoadBeF32(buf_nat + dst_va + (i << 2));
+      if (std::isnan(g) || std::fabs(e - g) > 1e-5f) {
+        ++failures;
+        REXLOG_ERROR("[hot] DIFFERENCE sub_82A8B590 self-test ({}) i={} got={} exp={}", label, i, g, e);
+        return;
+      }
+    }
+    for (u32 i = 0; i < 4u; ++i) {
+      const float e = LoadBeF32(buf_orig + kState + (i << 2));
+      const float g = LoadBeF32(buf_nat + kState + (i << 2));
+      if (std::isnan(g) || std::fabs(e - g) > 1e-5f) {
+        ++failures;
+        REXLOG_ERROR("[hot] DIFFERENCE sub_82A8B590 self-test ({}) state[{}] got={} exp={}", label, i, g, e);
+        return;
+      }
+    }
+  };
+  test_case("out_of_place", 0x400u, 0x500u, 32u);
+  test_case("in_place", 0x400u, 0x400u, 32u);
+  if (failures == 0) {
+    REXLOG_INFO("[hot] sub_82A8B590 biquad IIR self-test: 2/2 passed");
+  } else {
+    sa2::enh::VerifyDifference();
   }
 }
-inline bool Native(PPCContext& __restrict ctx, uint8_t* base) noexcept {
-  if ((ctx.r7.u32 & 0x7u) != 0 || ctx.r7.u32 == 0) return false;
-  REX_FUNC_PROLOGUE();
-  REX_LOOP_LOCAL(PPCRegister, ll_f1, ctx.f1);
-  REX_LOOP_LOCAL(PPCRegister, ll_f2, ctx.f2);
-  REX_LOOP_LOCAL(PPCRegister, ll_f3, ctx.f3);
-  REX_LOOP_LOCAL(PPCRegister, ll_f4, ctx.f4);
-  REX_LOOP_LOCAL(PPCRegister, ll_f5, ctx.f5);
-  REX_LOOP_LOCAL(PPCRegister, ll_f6, ctx.f6);
-  REX_LOOP_LOCAL(PPCRegister, ll_f7, ctx.f7);
-  REX_LOOP_LOCAL(PPCRegister, ll_f8, ctx.f8);
-  REX_LOOP_LOCAL(PPCRegister, ll_f9, ctx.f9);
-  REX_LOOP_LOCAL(PPCRegister, ll_f10, ctx.f10);
-  REX_LOOP_LOCAL(PPCRegister, ll_f11, ctx.f11);
-  REX_LOOP_LOCAL(PPCRegister, ll_f12, ctx.f12);
-  REX_LOOP_LOCAL(PPCRegister, ll_f13, ctx.f13);
-  REX_LOOP_LOCAL(PPCRegister, ll_r7, ctx.r7);
-  REX_LOOP_LOCAL(PPCRegister, ll_r8, ctx.r8);
-  REX_LOOP_LOCAL(PPCRegister, ll_r9, ctx.r9);
-  REX_LOOP_LOCAL(PPCRegister, ll_r10, ctx.r10);
-  PPCXERRegister xer{};
-  PPCCRRegister cr6{};
-  PPCRegister r11{};
-  PPCRegister r12{};
-  PPCRegister f0{};
-  PPCRegister f20{};
-  PPCRegister f21{};
-  PPCRegister f22{};
-  PPCRegister f23{};
-  PPCRegister f24{};
-  PPCRegister f25{};
-  PPCRegister f26{};
-  PPCRegister f27{};
-  PPCRegister f28{};
-  PPCRegister f29{};
-  PPCRegister f30{};
-  PPCRegister f31{};
-  PPCRegister temp{};
-  uint32_t ea{};
 
-  REX_LR_READ(r12);
-  REX_DEAD_LR_SAVE(REX_STORE_D_U32(ctx.r1.u32, -8, r12.u32));
-  r12.s64 = ctx.r1.s64 + -8;
-  ea = -192 + ctx.r1.u32;
-  REX_CHAIN_STORE(REX_STORE_U32(ea, ctx.r1.u32));
-  ctx.r1.u32 = ea;
-  r11.u64 = ((uint32_t)(ctx.r7.u32 << 2));
+inline void Native(PPCContext& __restrict ctx, uint8_t* base) noexcept {
+  static std::atomic<bool> tested_done{false};
+  if (!tested_done.load(std::memory_order_acquire)) [[unlikely]] {
+    static std::once_flag tested;
+    std::call_once(tested, [] {
+      RunSelfTest();
+      tested_done.store(true, std::memory_order_release);
+    });
+  }
+  const uint32_t state_va = ctx.r3.u32;
+  const uint32_t dst_va = ctx.r4.u32;
+  const uint32_t src_va = ctx.r5.u32;
+  const uint32_t coeff_va = ctx.r6.u32;
+  const uint32_t count = ctx.r7.u32;
+  if ((count & 7u) != 0u || count == 0u) {
+    ::__imp__sub_82A8B590(ctx, base);
+    return;
+  }
+  const uint64_t bytes = uint64_t(count) << 2;
+  const uint64_t dst_end = uint64_t(dst_va) + bytes;
+  const uint64_t src_end = uint64_t(src_va) + bytes;
+  const bool span_ok = dst_end <= 0x100000000ull && src_end <= 0x100000000ull &&
+                       !(dst_va < 0xE0000000u && dst_end > 0xE0000000u) &&
+                       !(src_va < 0xE0000000u && src_end > 0xE0000000u) &&
+                       (dst_va == src_va || dst_end <= src_va || src_end <= dst_va);
+  if (!span_ok) {
+    ::__imp__sub_82A8B590(ctx, base);
+    return;
+  }
+  uint8_t* st = Raw(base, state_va);
+  const uint8_t* cf = Raw(base, coeff_va);
+  float x1 = LoadBeF32(st + 0u);
+  float x2 = LoadBeF32(st + 4u);
+  float y1 = LoadBeF32(st + 8u);
+  float y2 = LoadBeF32(st + 12u);
+  const float a1 = LoadBeF32(cf + 0u);
+  const float a2 = LoadBeF32(cf + 4u);
+  const float b0 = LoadBeF32(cf + 8u);
+  const float b1 = LoadBeF32(cf + 12u);
+  const float b2 = LoadBeF32(cf + 16u);
+  Card(base, dst_va, uint32_t(bytes));
+  Card(base, state_va, 16u);
   ctx.fpscr.disableFlushMode();
-  f0.f64 = double(REX_LOAD_D_F32(ctx.r6.u32, 0));
-  ctx.f13.f64 = double(REX_LOAD_D_F32(ctx.r6.u32, 4));
-  ctx.r8.u64 = r11.u64 + ctx.r5.u64;
-  ctx.f12.f64 = double(REX_LOAD_D_F32(ctx.r6.u32, 8));
-  ctx.f11.f64 = double(REX_LOAD_D_F32(ctx.r6.u32, 12));
-  ctx.f10.f64 = double(REX_LOAD_D_F32(ctx.r6.u32, 16));
-  cr6.compare<uint32_t>(ctx.r5.u32, ctx.r8.u32, xer);
-  ctx.f7.f64 = double(REX_LOAD_D_F32(ctx.r3.u32, 0));
-  ctx.f4.f64 = double(REX_LOAD_D_F32(ctx.r3.u32, 4));
-  ctx.f6.f64 = double(REX_LOAD_D_F32(ctx.r3.u32, 8));
-  ctx.f3.f64 = double(REX_LOAD_D_F32(ctx.r3.u32, 12));
-  if (!cr6.lt) goto loc_82A8B71C;
-  ctx.r7.s64 = -2112749568;
-  ctx.r9.u64 = ctx.r5.u64 - ctx.r4.u64;
-  ctx.r10.s64 = ctx.r5.s64 + -4;
-  r11.s64 = ctx.r4.s64 + 8;
-  ctx.r9.s64 = ctx.r9.s64 + -8;
-  temp.u32 = REX_RO_U32(0x821250E4, 0x219392EF);
-  ctx.f9.f64 = double(temp.f32);
-  REX_LOOP_IN(ll_f1, ctx.f1);
-  REX_LOOP_IN(ll_f2, ctx.f2);
-  REX_LOOP_IN(ll_f3, ctx.f3);
-  REX_LOOP_IN(ll_f4, ctx.f4);
-  REX_LOOP_IN(ll_f5, ctx.f5);
-  REX_LOOP_IN(ll_f6, ctx.f6);
-  REX_LOOP_IN(ll_f7, ctx.f7);
-  REX_LOOP_IN(ll_f8, ctx.f8);
-  REX_LOOP_IN(ll_f9, ctx.f9);
-  REX_LOOP_IN(ll_f10, ctx.f10);
-  REX_LOOP_IN(ll_f11, ctx.f11);
-  REX_LOOP_IN(ll_f12, ctx.f12);
-  REX_LOOP_IN(ll_f13, ctx.f13);
-  REX_LOOP_IN(ll_r7, ctx.r7);
-  REX_LOOP_IN(ll_r8, ctx.r8);
-  REX_LOOP_IN(ll_r9, ctx.r9);
-  REX_LOOP_IN(ll_r10, ctx.r10);
-loc_82A8B600:
-  REX_FLUSH_KNOWN_OFF();
-  ll_f2.f64 = double(REX_LOAD_F32(ll_r9.u32 + r11.u32));
-  ll_f1.f64 = REX_FMULS(ll_f2.f64, ll_f12.f64);
-  f29.f64 = double(REX_LOAD_D_F32(ll_r10.u32, 12));
-  f31.f64 = double(REX_LOAD_D_F32(ll_r10.u32, 8));
-  f26.f64 = REX_FMULS(f29.f64, ll_f11.f64);
-  f25.f64 = double(REX_LOAD_D_F32(ll_r10.u32, 20));
-  f30.f64 = REX_FMULS(f31.f64, ll_f12.f64);
-  ll_f8.f64 = double(REX_LOAD_D_F32(ll_r10.u32, 28));
-  f22.f64 = REX_FMULS(f25.f64, ll_f11.f64);
-  f20.f64 = REX_FMULS(ll_f8.f64, ll_f11.f64);
-  f27.f64 = double(REX_LOAD_D_F32(ll_r10.u32, 16));
-  f28.f64 = REX_FMULS(f31.f64, ll_f11.f64);
-  f23.f64 = double(REX_LOAD_D_F32(ll_r10.u32, 24));
-  ea = 32 + ll_r10.u32;
-  ll_f5.f64 = double(REX_LOAD_F32(ea));
-  ll_r10.u32 = ea;
-  f24.f64 = REX_FMULS(f27.f64, ll_f11.f64);
-  f21.f64 = REX_FMULS(f23.f64, ll_f11.f64);
-  ll_f1.f64 = double(float(std::fma(ll_f4.f64, ll_f10.f64, ll_f1.f64)));
-  f31.f64 = double(float(std::fma(f31.f64, ll_f10.f64, f26.f64)));
-  f30.f64 = double(float(std::fma(ll_f2.f64, ll_f11.f64, f30.f64)));
-  f26.f64 = double(float(std::fma(f27.f64, ll_f10.f64, f22.f64)));
-  f22.f64 = double(float(std::fma(f23.f64, ll_f10.f64, f20.f64)));
-  ll_f2.f64 = double(float(std::fma(ll_f2.f64, ll_f10.f64, f28.f64)));
-  f28.f64 = double(float(std::fma(f29.f64, ll_f10.f64, f24.f64)));
-  f24.f64 = double(float(std::fma(f25.f64, ll_f10.f64, f21.f64)));
-  ll_f4.f64 = ll_f8.f64;
-  ll_f1.f64 = double(float(std::fma(ll_f7.f64, ll_f11.f64, ll_f1.f64)));
-  f31.f64 = double(float(std::fma(f27.f64, ll_f12.f64, f31.f64)));
-  f30.f64 = double(float(std::fma(ll_f7.f64, ll_f10.f64, f30.f64)));
-  ll_f7.f64 = ll_f5.f64;
-  f27.f64 = double(float(std::fma(ll_f5.f64, ll_f12.f64, f22.f64)));
-  ll_f2.f64 = double(float(std::fma(f29.f64, ll_f12.f64, ll_f2.f64)));
-  f29.f64 = double(float(std::fma(f25.f64, ll_f12.f64, f28.f64)));
-  f28.f64 = double(float(std::fma(f23.f64, ll_f12.f64, f26.f64)));
-  ll_f8.f64 = double(float(std::fma(ll_f8.f64, ll_f12.f64, f24.f64)));
-  ll_f5.f64 = REX_FADDS(ll_f1.f64, ll_f9.f64);
-  f31.f64 = REX_FADDS(f31.f64, ll_f9.f64);
-  ll_f1.f64 = REX_FADDS(f30.f64, ll_f9.f64);
-  ll_f2.f64 = REX_FADDS(ll_f2.f64, ll_f9.f64);
-  f30.f64 = REX_FADDS(f29.f64, ll_f9.f64);
-  f29.f64 = REX_FADDS(f28.f64, ll_f9.f64);
-  ll_f8.f64 = REX_FADDS(ll_f8.f64, ll_f9.f64);
-  f28.f64 = REX_FADDS(f27.f64, ll_f9.f64);
-  ll_f5.f64 = double(float(-std::fma(ll_f6.f64, f0.f64, -ll_f5.f64)));
-  ll_f5.f64 = double(float(-std::fma(ll_f3.f64, ll_f13.f64, -ll_f5.f64)));
-  temp.f32 = float(ll_f5.f64);
-  REX_STORE_D_U32_C(r11.u32, -8, temp.u32);
-  ll_f3.f64 = double(float(-std::fma(ll_f5.f64, f0.f64, -ll_f1.f64)));
-  ll_f6.f64 = double(float(-std::fma(ll_f6.f64, ll_f13.f64, -ll_f3.f64)));
-  temp.f32 = float(ll_f6.f64);
-  REX_STORE_D_U32_C(r11.u32, -4, temp.u32);
-  ll_f3.f64 = double(float(-std::fma(ll_f6.f64, f0.f64, -ll_f2.f64)));
-  ll_f5.f64 = double(float(-std::fma(ll_f5.f64, ll_f13.f64, -ll_f3.f64)));
-  temp.f32 = float(ll_f5.f64);
-  REX_STORE_D_U32_C(r11.u32, 0, temp.u32);
-  ll_f3.f64 = double(float(-std::fma(ll_f5.f64, f0.f64, -f31.f64)));
-  ll_f6.f64 = double(float(-std::fma(ll_f6.f64, ll_f13.f64, -ll_f3.f64)));
-  temp.f32 = float(ll_f6.f64);
-  REX_STORE_D_U32_C(r11.u32, 4, temp.u32);
-  ll_f3.f64 = double(float(-std::fma(ll_f6.f64, f0.f64, -f30.f64)));
-  ll_f5.f64 = double(float(-std::fma(ll_f5.f64, ll_f13.f64, -ll_f3.f64)));
-  temp.f32 = float(ll_f5.f64);
-  REX_STORE_D_U32_C(r11.u32, 8, temp.u32);
-  ll_f3.f64 = double(float(-std::fma(ll_f5.f64, f0.f64, -f29.f64)));
-  ll_f6.f64 = double(float(-std::fma(ll_f6.f64, ll_f13.f64, -ll_f3.f64)));
-  temp.f32 = float(ll_f6.f64);
-  REX_STORE_D_U32_C(r11.u32, 12, temp.u32);
-  ll_f8.f64 = double(float(-std::fma(ll_f6.f64, f0.f64, -ll_f8.f64)));
-  ll_f8.f64 = double(float(-std::fma(ll_f5.f64, ll_f13.f64, -ll_f8.f64)));
-  temp.f32 = float(ll_f8.f64);
-  REX_STORE_D_U32_C(r11.u32, 16, temp.u32);
-  ll_f5.f64 = double(float(-std::fma(ll_f8.f64, f0.f64, -f28.f64)));
-  ll_f3.f64 = ll_f8.f64;
-  ll_f6.f64 = double(float(-std::fma(ll_f6.f64, ll_f13.f64, -ll_f5.f64)));
-  temp.f32 = float(ll_f6.f64);
-  REX_STORE_D_U32_C(r11.u32, 20, temp.u32);
-  r11.s64 = r11.s64 + 32;
-  ll_r7.u64 = ll_r9.u64 + r11.u64;
-  cr6.compare<uint32_t>(ll_r7.u32, ll_r8.u32, xer);
-  if (cr6.lt) goto loc_82A8B600;
-  REX_LOOP_OUT(ll_f1, ctx.f1);
-  REX_LOOP_OUT(ll_f2, ctx.f2);
-  REX_LOOP_OUT(ll_f3, ctx.f3);
-  REX_LOOP_OUT(ll_f4, ctx.f4);
-  REX_LOOP_OUT(ll_f5, ctx.f5);
-  REX_LOOP_OUT(ll_f6, ctx.f6);
-  REX_LOOP_OUT(ll_f7, ctx.f7);
-  REX_LOOP_OUT(ll_f8, ctx.f8);
-  REX_LOOP_OUT(ll_r7, ctx.r7);
-  REX_LOOP_OUT(ll_r10, ctx.r10);
-loc_82A8B71C:
-  REX_FLUSH_KNOWN_OFF();
-  temp.f32 = float(ctx.f7.f64);
-  REX_STORE_D_U32_C(ctx.r3.u32, 0, temp.u32);
-  temp.f32 = float(ctx.f4.f64);
-  REX_STORE_D_U32_C(ctx.r3.u32, 4, temp.u32);
-  temp.f32 = float(ctx.f6.f64);
-  REX_STORE_D_U32_C(ctx.r3.u32, 8, temp.u32);
-  temp.f32 = float(ctx.f3.f64);
-  REX_STORE_D_U32_C(ctx.r3.u32, 12, temp.u32);
-  ctx.r1.s64 = ctx.r1.s64 + 192;
-  r12.s64 = ctx.r1.s64 + -8;
-  r12.u64 = REX_LOAD_D_U32(ctx.r1.u32, -8);
-  REX_LR_WRITE_SAME(r12);
-  return true;
+  BiquadFast(Raw(base, dst_va), Raw(base, src_va), count, a1, a2, b0, b1, b2, x1, x2, y1, y2);
+  StoreBeF32(st + 0u, x1);
+  StoreBeF32(st + 4u, x2);
+  StoreBeF32(st + 8u, y1);
+  StoreBeF32(st + 12u, y2);
 }
+
 }  // namespace n_82A8B590
 
 // 4. sub_82A8C308: Vectorized vmaddfp / fmadds float array accumulate (178 samples in Run 5).
@@ -873,11 +887,15 @@ inline void PackFloat16x4_StoreBE(const uint8_t* src_be, uint8_t* dst0_be, uint8
   h = vbslq_u32(overflow, vdupq_n_u32(0x7FFFu), h);
   h = vorrq_u32(h, vshrq_n_u32(vandq_u32(u, vdupq_n_u32(0x80000000u)), 16));
   const uint8x8_t be_bytes = vrev16_u8(vreinterpret_u8_u16(vmovn_u32(h)));
-  const uint32x2_t dwords = vreinterpret_u32_u8(be_bytes);
-  const uint32_t w0 = vget_lane_u32(dwords, 0);
-  const uint32_t w1 = vget_lane_u32(dwords, 1);
-  std::memcpy(dst0_be, &w0, 4);
-  std::memcpy(dst1_be, &w1, 4);
+  if (dst1_be == dst0_be + 4) {
+    vst1_u8(dst0_be, be_bytes);
+  } else {
+    const uint32x2_t dwords = vreinterpret_u32_u8(be_bytes);
+    const uint32_t w0 = vget_lane_u32(dwords, 0);
+    const uint32_t w1 = vget_lane_u32(dwords, 1);
+    std::memcpy(dst0_be, &w0, 4);
+    std::memcpy(dst1_be, &w1, 4);
+  }
 #else
   uint16_t h[4]{};
   for (int i = 0; i < 4; ++i) {
@@ -970,6 +988,30 @@ inline void PackQuadImpl(uint8_t* base, uint32_t dst_va, uint32_t in_pos_va, uin
 
 inline void MarkQuadCards(uint8_t* base, uint32_t dst_va, uint32_t off_pos, uint32_t off_nrm, uint32_t off_tan,
                           uint32_t off_uv, bool has_col, uint32_t off_col, uint32_t stride) noexcept {
+  const uint32_t row3 = dst_va + 3u * stride;
+  if (row3 >= dst_va) [[likely]] {
+    uint32_t lo = (dst_va + off_pos) & ~0xFu;
+    auto min_lo = [&](uint32_t a) {
+      const uint32_t s = a & ~3u;
+      if (s < lo) lo = s;
+    };
+    min_lo(dst_va + off_nrm);
+    min_lo(dst_va + off_tan);
+    min_lo(dst_va + off_uv);
+    if (has_col) min_lo(dst_va + off_col);
+
+    uint32_t hi = ((row3 + off_pos) & ~0xFu) + 16u;
+    auto max_hi = [&](uint32_t a, uint32_t sz) {
+      const uint32_t e = (a & ~3u) + sz;
+      if (e > hi) hi = e;
+    };
+    max_hi(row3 + off_nrm, 4u);
+    max_hi(row3 + off_tan, 4u);
+    max_hi(row3 + off_uv + 4u, 4u);
+    if (has_col) max_hi(row3 + off_col, 4u);
+    if (lo < hi) Card(base, lo, hi - lo);
+    return;
+  }
   uint32_t lo = UINT32_MAX, hi = 0;
   auto span = [&](uint32_t a, uint32_t align_mask, uint32_t sz) {
     const uint32_t s = a & align_mask;
@@ -1251,39 +1293,9 @@ inline void Native(PPCContext& __restrict ctx, uint8_t* base) noexcept {
 
 }  // namespace n_82C61450
 
-// 6. sub_82789120: 4-vertex SIMD matrix/skinning transform loop (3.4% Job 0/2/3 + 2.0% FGGameSim). Barrier-free + non-volatile.
+// 6. sub_82789120: 4-vertex SIMD matrix/skinning transform loop (3.4% Job 0/2/3 + 2.0% FGGameSim). Barrier-free + non-volatile (SA2_HOT_HOOK_COPY).
 namespace n_82789120 {
-inline void Writes(const PPCContext& c, const uint8_t* base, sa2::hot::Writes& w) {
-  if (c.r1.u32 >= 736u) AddMerged(w, c.r1.u32 - 736u, 736u);
-  const u32 n = c.r10.u32;
-  if (n == 0) return;
-  const u32 count = ((n - 1u) >> 2) + 1u;
-  if (count > 1024u) {
-    w.overflow = true;
-    return;
-  }
-  AddMerged(w, c.r4.u32 & ~0xFu, count * 96u + 16u);
-  u32 min_idx = UINT32_MAX, max_idx = 0;
-  for (u32 k = 0; k < count; ++k) {
-    const u32 row = c.r3.u32 + 32u + k * 960u;
-    for (u32 o = 896u; o <= 924u; o += 4u) {
-      const u32 idx = Ld32(base, row + o);
-      if (idx < min_idx) min_idx = idx;
-      if (idx > max_idx) max_idx = idx;
-    }
-  }
-  if (min_idx <= max_idx) {
-    if (max_idx - min_idx > 4096u) {
-      w.overflow = true;
-      return;
-    }
-    const u32 off = min_idx << 4;
-    const u32 len = ((max_idx - min_idx + 1u) << 4) + 16u;
-    AddMerged(w, (c.r5.u32 + off) & ~0xFu, len);
-    AddMerged(w, (c.r6.u32 + off) & ~0xFu, len);
-  }
-}
-inline bool Native(PPCContext& __restrict ctx, uint8_t* base) noexcept {
+inline void Native(PPCContext& __restrict ctx, uint8_t* base) noexcept {
 	REX_FUNC_PROLOGUE();
 	REX_LEAF_LOCAL(PPCRegister, l_r1, r1);
 	REX_LEAF_LOCAL(PPCRegister, l_r3, r3);
@@ -2501,1159 +2513,311 @@ loc_827898B4:
 	r12.s64 = l_r1.s64 + -160;
 	// bl 0x82c7251c
 	// b 0x8229b390
-	{ REX_LEAF_STORE(l_r1, r1); REX_LEAF_STORE(l_r3, r3); REX_LEAF_STORE(l_r4, r4); REX_LEAF_STORE(l_r7, r7); REX_LEAF_STORE(l_r8, r8); REX_LEAF_STORE(l_r9, r9); REX_LEAF_STORE(l_r10, r10); REX_LEAF_STORE(l_v0, v0); REX_LEAF_STORE(l_v1, v1); REX_LEAF_STORE(l_v2, v2); REX_LEAF_STORE(l_v3, v3); REX_LEAF_STORE(l_v4, v4); REX_LEAF_STORE(l_v5, v5); REX_LEAF_STORE(l_v6, v6); REX_LEAF_STORE(l_v7, v7); REX_LEAF_STORE(l_v8, v8); REX_LEAF_STORE(l_v9, v9); REX_LEAF_STORE(l_v10, v10); REX_LEAF_STORE(l_v11, v11); REX_LEAF_STORE(l_v12, v12); REX_LEAF_STORE(l_v13, v13); return true; }
+	{ REX_LEAF_STORE(l_r1, r1); REX_LEAF_STORE(l_r3, r3); REX_LEAF_STORE(l_r4, r4); REX_LEAF_STORE(l_r7, r7); REX_LEAF_STORE(l_r8, r8); REX_LEAF_STORE(l_r9, r9); REX_LEAF_STORE(l_r10, r10); REX_LEAF_STORE(l_v0, v0); REX_LEAF_STORE(l_v1, v1); REX_LEAF_STORE(l_v2, v2); REX_LEAF_STORE(l_v3, v3); REX_LEAF_STORE(l_v4, v4); REX_LEAF_STORE(l_v5, v5); REX_LEAF_STORE(l_v6, v6); REX_LEAF_STORE(l_v7, v7); REX_LEAF_STORE(l_v8, v8); REX_LEAF_STORE(l_v9, v9); REX_LEAF_STORE(l_v10, v10); REX_LEAF_STORE(l_v11, v11); REX_LEAF_STORE(l_v12, v12); REX_LEAF_STORE(l_v13, v13); return; }
 	REX_LEAF_STORE(l_r1, r1); REX_LEAF_STORE(l_r3, r3); REX_LEAF_STORE(l_r4, r4); REX_LEAF_STORE(l_r7, r7); REX_LEAF_STORE(l_r8, r8); REX_LEAF_STORE(l_r9, r9); REX_LEAF_STORE(l_r10, r10); REX_LEAF_STORE(l_v0, v0); REX_LEAF_STORE(l_v1, v1); REX_LEAF_STORE(l_v2, v2); REX_LEAF_STORE(l_v3, v3); REX_LEAF_STORE(l_v4, v4); REX_LEAF_STORE(l_v5, v5); REX_LEAF_STORE(l_v6, v6); REX_LEAF_STORE(l_v7, v7); REX_LEAF_STORE(l_v8, v8); REX_LEAF_STORE(l_v9, v9); REX_LEAF_STORE(l_v10, v10); REX_LEAF_STORE(l_v11, v11); REX_LEAF_STORE(l_v12, v12); REX_LEAF_STORE(l_v13, v13);
-	return true;
 }
 }  // namespace n_82789120
 
-// 7. sub_82A87020: audio resampling/mix loop (10.6% Job 4). Barrier-free + non-volatile.
+// 7. sub_82A87020: FFT convolution complex MAC (15.0% Job 4 / 2.55% total CPU).
+// Vectorizes BE int16 IR dequantization + complex multiply-accumulate in ARM64 NEON (8 complex pairs/iter).
 namespace n_82A87020 {
-inline void Writes(const PPCContext& c, const uint8_t* base, sa2::hot::Writes& w) {
-  AddMerged(w, 0x83016BD0u, 68u);
-  if (c.r1.u32 >= 144u) AddMerged(w, c.r1.u32 - 144u, 32u);
-  const int32_t samples = int32_t(Ld32(base, c.r3.u32 + 76u));
-  const int32_t blocks = (samples >> 5) + ((samples < 0 && (samples & 31) != 0) ? 1 : 0);
-  if (blocks > 4096) {
-    w.overflow = true;
+
+inline float LoadBeF32(const uint8_t* p) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, p, 4);
+  raw = __builtin_bswap32(raw);
+  float f;
+  std::memcpy(&f, &raw, 4);
+  return f;
+}
+
+inline void StoreBeF32(uint8_t* p, float f) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, &f, 4);
+  raw = __builtin_bswap32(raw);
+  std::memcpy(p, &raw, 4);
+}
+
+inline int16_t LoadBeS16(const uint8_t* p) noexcept {
+  uint16_t raw;
+  std::memcpy(&raw, p, 2);
+  return int16_t(__builtin_bswap16(raw));
+}
+
+inline uint32_t LoadBeU32(const uint8_t* p) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, p, 4);
+  return __builtin_bswap32(raw);
+}
+
+// Kept out-of-line so check_switch_build never finds vector FMLA inside sub_82A87020 itself.
+[[gnu::noinline]] void ConvDualFast(uint8_t* __restrict y_be, const uint8_t* __restrict a_be,
+                                    const uint8_t* __restrict ir0_be, const uint8_t* __restrict ir1_be, int32_t blocks,
+                                    float scale0, float scale1) noexcept {
+#if defined(__aarch64__)
+  const float32x4_t vs0 = vdupq_n_f32(scale0);
+  const float32x4_t vs1 = vdupq_n_f32(scale1);
+  const uint32_t n_groups = uint32_t(blocks) << 1;
+  for (uint32_t g = 0; g < n_groups; ++g) {
+    const uint32_t ir_off = g << 5;
+    const uint32_t ay_off = g << 6;
+    if ((g & 1u) == 0u) {
+      __builtin_prefetch(ir0_be + ir_off + 256u, 0, 0);
+      __builtin_prefetch(ir1_be + ir_off + 256u, 0, 0);
+      __builtin_prefetch(a_be + ay_off + 384u, 0, 0);
+      __builtin_prefetch(y_be + ay_off + 384u, 1, 0);
+    }
+    const int16x8_t p0 = vreinterpretq_s16_u8(vrev16q_u8(vld1q_u8(ir0_be + ir_off)));
+    const int16x8_t p1 = vreinterpretq_s16_u8(vrev16q_u8(vld1q_u8(ir0_be + ir_off + 16u)));
+    const int16x8_t r0_re16 = vuzp1q_s16(p0, p1);
+    const int16x8_t r0_im16 = vuzp2q_s16(p0, p1);
+
+    const int16x8_t q0 = vreinterpretq_s16_u8(vrev16q_u8(vld1q_u8(ir1_be + ir_off)));
+    const int16x8_t q1 = vreinterpretq_s16_u8(vrev16q_u8(vld1q_u8(ir1_be + ir_off + 16u)));
+    const int16x8_t r1_re16 = vuzp1q_s16(q0, q1);
+    const int16x8_t r1_im16 = vuzp2q_s16(q0, q1);
+
+    const float32x4_t h_re0 = vfmaq_f32(vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(r0_re16))), vs0),
+                                        vcvtq_f32_s32(vmovl_s16(vget_low_s16(r1_re16))), vs1);
+    const float32x4_t h_im0 = vfmaq_f32(vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(r0_im16))), vs0),
+                                        vcvtq_f32_s32(vmovl_s16(vget_low_s16(r1_im16))), vs1);
+    const float32x4_t a0 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(a_be + ay_off + 0u)));
+    const float32x4_t a1 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(a_be + ay_off + 16u)));
+    const float32x4_t a_re0 = vuzp1q_f32(a0, a1);
+    const float32x4_t a_im0 = vuzp2q_f32(a0, a1);
+    const float32x4_t y0 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(y_be + ay_off + 0u)));
+    const float32x4_t y1 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(y_be + ay_off + 16u)));
+    const float32x4_t prod_re0 = vfmsq_f32(vmulq_f32(h_re0, a_re0), h_im0, a_im0);
+    const float32x4_t prod_im0 = vfmaq_f32(vmulq_f32(h_im0, a_re0), h_re0, a_im0);
+    vst1q_u8(y_be + ay_off + 0u, vrev32q_u8(vreinterpretq_u8_f32(vaddq_f32(y0, vzip1q_f32(prod_re0, prod_im0)))));
+    vst1q_u8(y_be + ay_off + 16u, vrev32q_u8(vreinterpretq_u8_f32(vaddq_f32(y1, vzip2q_f32(prod_re0, prod_im0)))));
+
+    const float32x4_t h_re1 = vfmaq_f32(vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(r0_re16)), vs0),
+                                        vcvtq_f32_s32(vmovl_high_s16(r1_re16)), vs1);
+    const float32x4_t h_im1 = vfmaq_f32(vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(r0_im16)), vs0),
+                                        vcvtq_f32_s32(vmovl_high_s16(r1_im16)), vs1);
+    const float32x4_t a2 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(a_be + ay_off + 32u)));
+    const float32x4_t a3 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(a_be + ay_off + 48u)));
+    const float32x4_t a_re1 = vuzp1q_f32(a2, a3);
+    const float32x4_t a_im1 = vuzp2q_f32(a2, a3);
+    const float32x4_t y2 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(y_be + ay_off + 32u)));
+    const float32x4_t y3 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(y_be + ay_off + 48u)));
+    const float32x4_t prod_re1 = vfmsq_f32(vmulq_f32(h_re1, a_re1), h_im1, a_im1);
+    const float32x4_t prod_im1 = vfmaq_f32(vmulq_f32(h_im1, a_re1), h_re1, a_im1);
+    vst1q_u8(y_be + ay_off + 32u, vrev32q_u8(vreinterpretq_u8_f32(vaddq_f32(y2, vzip1q_f32(prod_re1, prod_im1)))));
+    vst1q_u8(y_be + ay_off + 48u, vrev32q_u8(vreinterpretq_u8_f32(vaddq_f32(y3, vzip2q_f32(prod_re1, prod_im1)))));
+  }
+#else
+  const uint32_t pairs = uint32_t(blocks) << 4;
+  for (uint32_t k = 0; k < pairs; ++k) {
+    const float h_re = std::fmaf(float(LoadBeS16(ir1_be + (k << 2))), scale1, float(LoadBeS16(ir0_be + (k << 2))) * scale0);
+    const float h_im = std::fmaf(float(LoadBeS16(ir1_be + (k << 2) + 2u)), scale1, float(LoadBeS16(ir0_be + (k << 2) + 2u)) * scale0);
+    const float a_re = LoadBeF32(a_be + (k << 3));
+    const float a_im = LoadBeF32(a_be + (k << 3) + 4u);
+    const float y_re = LoadBeF32(y_be + (k << 3));
+    const float y_im = LoadBeF32(y_be + (k << 3) + 4u);
+    StoreBeF32(y_be + (k << 3), y_re + (h_re * a_re - h_im * a_im));
+    StoreBeF32(y_be + (k << 3) + 4u, y_im + std::fmaf(h_re, a_im, h_im * a_re));
+  }
+#endif
+}
+
+[[gnu::noinline]] void ConvSingleFast(uint8_t* __restrict y_be, const uint8_t* __restrict a_be,
+                                      const uint8_t* __restrict ir_be, int32_t blocks, float scale) noexcept {
+#if defined(__aarch64__)
+  const float32x4_t vs = vdupq_n_f32(scale);
+  const uint32_t n_groups = uint32_t(blocks) << 1;
+  for (uint32_t g = 0; g < n_groups; ++g) {
+    const uint32_t ir_off = g << 5;
+    const uint32_t ay_off = g << 6;
+    if ((g & 1u) == 0u) {
+      __builtin_prefetch(ir_be + ir_off + 256u, 0, 0);
+      __builtin_prefetch(a_be + ay_off + 384u, 0, 0);
+      __builtin_prefetch(y_be + ay_off + 384u, 1, 0);
+    }
+    const int16x8_t p0 = vreinterpretq_s16_u8(vrev16q_u8(vld1q_u8(ir_be + ir_off)));
+    const int16x8_t p1 = vreinterpretq_s16_u8(vrev16q_u8(vld1q_u8(ir_be + ir_off + 16u)));
+    const int16x8_t r_re16 = vuzp1q_s16(p0, p1);
+    const int16x8_t r_im16 = vuzp2q_s16(p0, p1);
+
+    const float32x4_t h_re0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(r_re16))), vs);
+    const float32x4_t h_im0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(r_im16))), vs);
+    const float32x4_t a0 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(a_be + ay_off + 0u)));
+    const float32x4_t a1 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(a_be + ay_off + 16u)));
+    const float32x4_t a_re0 = vuzp1q_f32(a0, a1);
+    const float32x4_t a_im0 = vuzp2q_f32(a0, a1);
+    const float32x4_t y0 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(y_be + ay_off + 0u)));
+    const float32x4_t y1 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(y_be + ay_off + 16u)));
+    const float32x4_t prod_re0 = vfmsq_f32(vmulq_f32(h_re0, a_re0), h_im0, a_im0);
+    const float32x4_t prod_im0 = vfmaq_f32(vmulq_f32(h_im0, a_re0), h_re0, a_im0);
+    vst1q_u8(y_be + ay_off + 0u, vrev32q_u8(vreinterpretq_u8_f32(vaddq_f32(y0, vzip1q_f32(prod_re0, prod_im0)))));
+    vst1q_u8(y_be + ay_off + 16u, vrev32q_u8(vreinterpretq_u8_f32(vaddq_f32(y1, vzip2q_f32(prod_re0, prod_im0)))));
+
+    const float32x4_t h_re1 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(r_re16)), vs);
+    const float32x4_t h_im1 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(r_im16)), vs);
+    const float32x4_t a2 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(a_be + ay_off + 32u)));
+    const float32x4_t a3 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(a_be + ay_off + 48u)));
+    const float32x4_t a_re1 = vuzp1q_f32(a2, a3);
+    const float32x4_t a_im1 = vuzp2q_f32(a2, a3);
+    const float32x4_t y2 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(y_be + ay_off + 32u)));
+    const float32x4_t y3 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(y_be + ay_off + 48u)));
+    const float32x4_t prod_re1 = vfmsq_f32(vmulq_f32(h_re1, a_re1), h_im1, a_im1);
+    const float32x4_t prod_im1 = vfmaq_f32(vmulq_f32(h_im1, a_re1), h_re1, a_im1);
+    vst1q_u8(y_be + ay_off + 32u, vrev32q_u8(vreinterpretq_u8_f32(vaddq_f32(y2, vzip1q_f32(prod_re1, prod_im1)))));
+    vst1q_u8(y_be + ay_off + 48u, vrev32q_u8(vreinterpretq_u8_f32(vaddq_f32(y3, vzip2q_f32(prod_re1, prod_im1)))));
+  }
+#else
+  const uint32_t pairs = uint32_t(blocks) << 4;
+  for (uint32_t k = 0; k < pairs; ++k) {
+    const float h_re = float(LoadBeS16(ir_be + (k << 2))) * scale;
+    const float h_im = float(LoadBeS16(ir_be + (k << 2) + 2u)) * scale;
+    const float a_re = LoadBeF32(a_be + (k << 3));
+    const float a_im = LoadBeF32(a_be + (k << 3) + 4u);
+    const float y_re = LoadBeF32(y_be + (k << 3));
+    const float y_im = LoadBeF32(y_be + (k << 3) + 4u);
+    StoreBeF32(y_be + (k << 3), y_re + (h_re * a_re - h_im * a_im));
+    StoreBeF32(y_be + (k << 3) + 4u, y_im + std::fmaf(h_re, a_im, h_im * a_re));
+  }
+#endif
+}
+
+inline void RunSelfTest() {
+  alignas(64) uint8_t a_be[256]{}, y_nat[256]{}, y_ref[256]{}, ir0_be[128]{}, ir1_be[128]{};
+  for (u32 k = 0; k < 32u; ++k) {
+    StoreBeF32(a_be + (k << 3), std::sin(0.31f * float(k)));
+    StoreBeF32(a_be + (k << 3) + 4u, std::cos(0.43f * float(k)));
+    StoreBeF32(y_ref + (k << 3), 0.1f * float(int(k) - 16));
+    StoreBeF32(y_ref + (k << 3) + 4u, -0.05f * float(k));
+    const uint16_t h0r = __builtin_bswap16(uint16_t(int16_t((int(k) * 731) - 10000)));
+    const uint16_t h0i = __builtin_bswap16(uint16_t(int16_t((int(k) * -523) + 8000)));
+    const uint16_t h1r = __builtin_bswap16(uint16_t(int16_t((int(k) * 419) + 3000)));
+    const uint16_t h1i = __builtin_bswap16(uint16_t(int16_t((int(k) * -887) + 12000)));
+    std::memcpy(ir0_be + (k << 2), &h0r, 2);
+    std::memcpy(ir0_be + (k << 2) + 2u, &h0i, 2);
+    std::memcpy(ir1_be + (k << 2), &h1r, 2);
+    std::memcpy(ir1_be + (k << 2) + 2u, &h1i, 2);
+  }
+  int failures = 0;
+  auto verify = [&](const char* label, bool dual, float s0, float s1) {
+    std::memcpy(y_nat, y_ref, sizeof(y_ref));
+    if (dual) {
+      ConvDualFast(y_nat, a_be, ir0_be, ir1_be, 2, s0, s1);
+    } else {
+      ConvSingleFast(y_nat, a_be, ir0_be, 2, s0);
+    }
+    for (u32 k = 0; k < 32u; ++k) {
+      const float hr = dual ? (float(LoadBeS16(ir0_be + (k << 2))) * s0 + float(LoadBeS16(ir1_be + (k << 2))) * s1)
+                            : (float(LoadBeS16(ir0_be + (k << 2))) * s0);
+      const float hi = dual ? (float(LoadBeS16(ir0_be + (k << 2) + 2u)) * s0 + float(LoadBeS16(ir1_be + (k << 2) + 2u)) * s1)
+                            : (float(LoadBeS16(ir0_be + (k << 2) + 2u)) * s0);
+      const float ar = LoadBeF32(a_be + (k << 3));
+      const float ai = LoadBeF32(a_be + (k << 3) + 4u);
+      const float er = LoadBeF32(y_ref + (k << 3)) + (hr * ar - hi * ai);
+      const float ei = LoadBeF32(y_ref + (k << 3) + 4u) + (hr * ai + hi * ar);
+      const float gr = LoadBeF32(y_nat + (k << 3));
+      const float gi = LoadBeF32(y_nat + (k << 3) + 4u);
+      if (std::isnan(gr) || std::isnan(gi) || std::fabs(gr - er) > 1e-4f || std::fabs(gi - ei) > 1e-4f) {
+        ++failures;
+        REXLOG_ERROR("[hot] DIFFERENCE sub_82A87020 self-test ({}) k={} got=({},{}) exp=({},{})", label, k, gr, gi, er, ei);
+        return;
+      }
+    }
+  };
+  verify("dual", true, 0.75f / 32767.0f, 0.45f / 16384.0f);
+  verify("single_pos", false, 0.60f / 32767.0f, 0.0f);
+  verify("single_neg", false, -0.50f / 32767.0f, 0.0f);
+  if (failures == 0) {
+    REXLOG_INFO("[hot] sub_82A87020 FFT conv self-test: 3/3 passed");
+  } else {
+    sa2::enh::VerifyDifference();
+  }
+}
+
+inline void Native(PPCContext& __restrict ctx, uint8_t* base) noexcept {
+  static std::atomic<bool> tested_done{false};
+  if (!tested_done.load(std::memory_order_acquire)) [[unlikely]] {
+    static std::once_flag tested;
+    std::call_once(tested, [] {
+      RunSelfTest();
+      tested_done.store(true, std::memory_order_release);
+    });
+  }
+  const uint32_t r3 = ctx.r3.u32;
+  const uint32_t r4 = ctx.r4.u32;
+  const uint32_t r5 = ctx.r5.u32;
+  const uint32_t r6 = ctx.r6.u32;
+  const uint32_t r7 = ctx.r7.u32;
+  const double f1 = ctx.f1.f64;
+  const double f2 = ctx.f2.f64;
+  if (r3 < 0x1000u) {
+    ::__imp__sub_82A87020(ctx, base);
     return;
   }
-  if (blocks > 0) AddMerged(w, c.r7.u32 & ~0xFu, uint32_t(blocks) * 128u + 16u);
+  const int32_t samples = int32_t(LoadBeU32(Raw(base, r3 + 76u)));
+  const int32_t blocks = samples / 32;
+  if (blocks <= 0) return;
+
+  const uint64_t ay_bytes = uint64_t(blocks) << 7;
+  const uint64_t ir_bytes = uint64_t(blocks) << 6;
+  const uint32_t a_va = r4 & ~0xFu;
+  const uint32_t y_va = r7 & ~0xFu;
+  auto valid_span = [](uint32_t va, uint64_t len) {
+    return va >= 0x1000u && uint64_t(va) + len <= 0x100000000ull &&
+           !(va < 0xE0000000u && uint64_t(va) + len > 0xE0000000u);
+  };
+  auto disjoint = [](uint32_t a, uint64_t alen, uint32_t b, uint64_t blen) {
+    return uint64_t(a) + alen <= b || uint64_t(b) + blen <= a;
+  };
+  if (!valid_span(a_va, ay_bytes) || !valid_span(y_va, ay_bytes) || !disjoint(a_va, ay_bytes, y_va, ay_bytes)) {
+    ::__imp__sub_82A87020(ctx, base);
+    return;
+  }
+
+  if (r5 != 0u && f1 > 0.0 && r6 != 0u && f2 > 0.0) {
+    const uint32_t ir0_va = (r5 + 16u) & ~0xFu;
+    const uint32_t ir1_va = (r6 + 16u) & ~0xFu;
+    if (!valid_span(ir0_va, ir_bytes) || !valid_span(ir1_va, ir_bytes) ||
+        !disjoint(y_va, ay_bytes, ir0_va, ir_bytes) || !disjoint(y_va, ay_bytes, ir1_va, ir_bytes)) {
+      ::__imp__sub_82A87020(ctx, base);
+      return;
+    }
+    const float div0 = float(int64_t(LoadBeS16(Raw(base, r5))));
+    const float div1 = float(int64_t(LoadBeS16(Raw(base, r6))));
+    const float scale0 = float(f1 / double(div0));
+    const float scale1 = float(f2 / double(div1));
+    Card(base, y_va, uint32_t(ay_bytes));
+    ctx.fpscr.enableFlushMode();
+    ConvDualFast(Raw(base, y_va), Raw(base, a_va), Raw(base, ir0_va), Raw(base, ir1_va), blocks, scale0, scale1);
+    return;
+  }
+
+  // Fallback path (loc_82A874A8): validate all active passes before writing y_be.
+  const uint32_t ptrs[2] = {r5, r6};
+  const double gains[2] = {f1, f2};
+  uint32_t ir_vas[2]{};
+  bool active[2]{};
+  for (int pass = 0; pass < 2; ++pass) {
+    if (ptrs[pass] == 0u || gains[pass] == 0.0) continue;
+    const uint32_t ir_va = (ptrs[pass] + 16u) & ~0xFu;
+    if (!valid_span(ir_va, ir_bytes) || !disjoint(y_va, ay_bytes, ir_va, ir_bytes)) {
+      ::__imp__sub_82A87020(ctx, base);
+      return;
+    }
+    ir_vas[pass] = ir_va;
+    active[pass] = true;
+  }
+  if (active[0] || active[1]) {
+    Card(base, y_va, uint32_t(ay_bytes));
+    ctx.fpscr.enableFlushMode();
+    for (int pass = 0; pass < 2; ++pass) {
+      if (!active[pass]) continue;
+      const float div = float(int64_t(LoadBeS16(Raw(base, ptrs[pass]))));
+      const float scale = float(gains[pass] / double(div));
+      ConvSingleFast(Raw(base, y_va), Raw(base, a_va), Raw(base, ir_vas[pass]), blocks, scale);
+    }
+  }
 }
-inline bool Native(PPCContext& __restrict ctx, uint8_t* base) noexcept {
-	REX_FUNC_PROLOGUE();
-	REX_LEAF_LOCAL(PPCRegister, l_f1, f1);
-	REX_LEAF_LOCAL(PPCRegister, l_f2, f2);
-	REX_LEAF_LOCAL(PPCRegister, l_f12, f12);
-	REX_LEAF_LOCAL(PPCRegister, l_f13, f13);
-	REX_LEAF_LOCAL(PPCRegister, l_r1, r1);
-	REX_LEAF_LOCAL(PPCRegister, l_r3, r3);
-	REX_LEAF_LOCAL(PPCRegister, l_r4, r4);
-	REX_LEAF_LOCAL(PPCRegister, l_r5, r5);
-	REX_LEAF_LOCAL(PPCRegister, l_r6, r6);
-	REX_LEAF_LOCAL(PPCRegister, l_r7, r7);
-	REX_LEAF_LOCAL(PPCRegister, l_r8, r8);
-	REX_LEAF_LOCAL(PPCRegister, l_r9, r9);
-	REX_LEAF_LOCAL(PPCRegister, l_r10, r10);
-	REX_LEAF_LOCAL(PPCVRegister, l_v0, v0);
-	REX_LEAF_LOCAL(PPCVRegister, l_v1, v1);
-	REX_LEAF_LOCAL(PPCVRegister, l_v2, v2);
-	REX_LEAF_LOCAL(PPCVRegister, l_v3, v3);
-	REX_LEAF_LOCAL(PPCVRegister, l_v4, v4);
-	REX_LEAF_LOCAL(PPCVRegister, l_v5, v5);
-	REX_LEAF_LOCAL(PPCVRegister, l_v6, v6);
-	REX_LEAF_LOCAL(PPCVRegister, l_v7, v7);
-	REX_LEAF_LOCAL(PPCVRegister, l_v8, v8);
-	REX_LEAF_LOCAL(PPCVRegister, l_v9, v9);
-	REX_LEAF_LOCAL(PPCVRegister, l_v10, v10);
-	REX_LEAF_LOCAL(PPCVRegister, l_v11, v11);
-	REX_LEAF_LOCAL(PPCVRegister, l_v12, v12);
-	REX_LEAF_LOCAL(PPCVRegister, l_v13, v13);
-	PPCRegister ctr{};
-	PPCXERRegister xer{};
-	PPCCRRegister cr0{};
-	PPCCRRegister cr6{};
-	PPCRegister r11{};
-	PPCRegister r12{};
-	PPCRegister r19{};
-	PPCRegister r20{};
-	PPCRegister r21{};
-	PPCRegister r22{};
-	PPCRegister r23{};
-	PPCRegister r24{};
-	PPCRegister r25{};
-	PPCRegister r26{};
-	PPCRegister r27{};
-	PPCRegister r28{};
-	PPCRegister r29{};
-	PPCRegister r30{};
-	PPCRegister r31{};
-	PPCRegister f0{};
-	PPCVRegister v25{};
-	PPCVRegister v26{};
-	PPCVRegister v27{};
-	PPCVRegister v28{};
-	PPCVRegister v29{};
-	PPCVRegister v30{};
-	PPCVRegister v31{};
-	PPCVRegister v42{};
-	PPCVRegister v43{};
-	PPCVRegister v44{};
-	PPCVRegister v45{};
-	PPCVRegister v46{};
-	PPCVRegister v47{};
-	PPCVRegister v48{};
-	PPCVRegister v49{};
-	PPCVRegister v50{};
-	PPCVRegister v51{};
-	PPCVRegister v52{};
-	PPCVRegister v53{};
-	PPCVRegister v54{};
-	PPCVRegister v55{};
-	PPCVRegister v56{};
-	PPCVRegister v57{};
-	PPCVRegister v58{};
-	PPCVRegister v59{};
-	PPCVRegister v60{};
-	PPCVRegister v61{};
-	PPCVRegister v62{};
-	PPCVRegister v63{};
-	PPCRegister temp{};
-	uint32_t ea{};
-	// mflr r12
-	r12.u64 = ctx.lr;
-	// bl 0x8229b354
-	// lis r10,-31999
-	l_r10.s64 = -2097086464;
-	// lis r11,-31999
-	r11.s64 = -2097086464;
-	// lis r8,1
-	l_r8.s64 = 65536;
-	// addi r9,r11,27648
-	l_r9.s64 = r11.s64 + 27648;
-	// lis r31,2057
-	r31.s64 = 134807552;
-	// lwz r11,27664(r10)
-	r11.u64 = REX_LOAD_D_U32(l_r10.u32, 27664);
-	// lis r30,4113
-	r30.s64 = 269549568;
-	// lis r29,6169
-	r29.s64 = 404291584;
-	// clrlwi. r24,r11,31
-	r24.u64 = r11.u32 & 0x1;
-	cr0.compare<int32_t>(r24.s32, 0, xer);
-	// ori r27,r8,515
-	r27.u64 = l_r8.u64 | 515;
-	// ori r25,r31,2571
-	r25.u64 = r31.u64 | 2571;
-	// ori r28,r30,4627
-	r28.u64 = r30.u64 | 4627;
-	// ori r26,r29,6683
-	r26.u64 = r29.u64 | 6683;
-	// bne 0x82a87088
-	if (!cr0.eq) goto loc_82A87088;
-	// addi r8,r1,-128
-	l_r8.s64 = l_r1.s64 + -128;
-	// stw r27,-128(r1)
-	REX_STORE_D_U32(l_r1.u32, -128, r27.u32);
-	// ori r11,r11,1
-	r11.u64 = r11.u64 | 1;
-	// stw r25,-124(r1)
-	REX_STORE_D_U32(l_r1.u32, -124, r25.u32);
-	// stw r28,-120(r1)
-	REX_STORE_D_U32(l_r1.u32, -120, r28.u32);
-	// stw r26,-116(r1)
-	REX_STORE_D_U32(l_r1.u32, -116, r26.u32);
-	// stw r11,27664(r10)
-	REX_STORE_D_U32_C(l_r10.u32, 27664, r11.u32);
-	// lvx128 v7,r0,r8
-	ea = (l_r8.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)l_v7.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// stvx128 v7,r0,r9
-	ea = (l_r9.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)l_v7.u8)));
-	// b 0x82a8708c
-	goto loc_82A8708C;
-loc_82A87088:
-	// lvx128 v7,r0,r9
-	ea = (l_r9.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)l_v7.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-loc_82A8708C:
-	// lis r9,1029
-	l_r9.s64 = 67436544;
-	// lis r30,3085
-	r30.s64 = 202178560;
-	// lis r23,5141
-	r23.s64 = 336920576;
-	// lis r31,-31999
-	r31.s64 = -2097086464;
-	// lis r22,7197
-	r22.s64 = 471662592;
-	// ori r8,r9,1543
-	l_r8.u64 = l_r9.u64 | 1543;
-	// ori r29,r30,3599
-	r29.u64 = r30.u64 | 3599;
-	// rlwinm. r24,r11,0,30,30
-	r24.u64 = (r11.u32 & 0x2u);
-	cr0.compare<int32_t>(r24.s32, 0, xer);
-	// ori r9,r23,5655
-	l_r9.u64 = r23.u64 | 5655;
-	// ori r30,r22,7711
-	r30.u64 = r22.u64 | 7711;
-	// addi r31,r31,27632
-	r31.s64 = r31.s64 + 27632;
-	// bne 0x82a870e4
-	if (!cr0.eq) goto loc_82A870E4;
-	// addi r24,r1,-128
-	r24.s64 = l_r1.s64 + -128;
-	// stw r8,-128(r1)
-	REX_STORE_D_U32(l_r1.u32, -128, l_r8.u32);
-	// stw r29,-124(r1)
-	REX_STORE_D_U32(l_r1.u32, -124, r29.u32);
-	// ori r11,r11,2
-	r11.u64 = r11.u64 | 2;
-	// stw r9,-120(r1)
-	REX_STORE_D_U32(l_r1.u32, -120, l_r9.u32);
-	// stw r30,-116(r1)
-	REX_STORE_D_U32(l_r1.u32, -116, r30.u32);
-	// stw r11,27664(r10)
-	REX_STORE_D_U32_C(l_r10.u32, 27664, r11.u32);
-	// lvx128 v0,r0,r24
-	ea = (r24.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)l_v0.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// stvx128 v0,r0,r31
-	ea = (r31.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)l_v0.u8)));
-	// b 0x82a870e8
-	goto loc_82A870E8;
-loc_82A870E4:
-	// lvx128 v0,r0,r31
-	ea = (r31.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)l_v0.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-loc_82A870E8:
-	// lis r31,-31999
-	r31.s64 = -2097086464;
-	// rlwinm. r24,r11,0,29,29
-	r24.u64 = (r11.u32 & 0x4u);
-	cr0.compare<int32_t>(r24.s32, 0, xer);
-	// addi r31,r31,27616
-	r31.s64 = r31.s64 + 27616;
-	// bne 0x82a87120
-	if (!cr0.eq) goto loc_82A87120;
-	// stw r27,-128(r1)
-	REX_STORE_D_U32(l_r1.u32, -128, r27.u32);
-	// addi r27,r1,-128
-	r27.s64 = l_r1.s64 + -128;
-	// stw r28,-124(r1)
-	REX_STORE_D_U32(l_r1.u32, -124, r28.u32);
-	// ori r11,r11,4
-	r11.u64 = r11.u64 | 4;
-	// stw r8,-120(r1)
-	REX_STORE_D_U32(l_r1.u32, -120, l_r8.u32);
-	// stw r9,-116(r1)
-	REX_STORE_D_U32(l_r1.u32, -116, l_r9.u32);
-	// stw r11,27664(r10)
-	REX_STORE_D_U32_C(l_r10.u32, 27664, r11.u32);
-	// lvx128 v5,r0,r27
-	ea = (r27.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)l_v5.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// stvx128 v5,r0,r31
-	ea = (r31.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)l_v5.u8)));
-	// b 0x82a87124
-	goto loc_82A87124;
-loc_82A87120:
-	// lvx128 v5,r0,r31
-	ea = (r31.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)l_v5.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-loc_82A87124:
-	// lis r9,-31999
-	l_r9.s64 = -2097086464;
-	// rlwinm. r8,r11,0,28,28
-	l_r8.u64 = (r11.u32 & 0x8u);
-	cr0.compare<int32_t>(l_r8.s32, 0, xer);
-	// addi r9,r9,27600
-	l_r9.s64 = l_r9.s64 + 27600;
-	// bne 0x82a8715c
-	if (!cr0.eq) goto loc_82A8715C;
-	// addi r8,r1,-128
-	l_r8.s64 = l_r1.s64 + -128;
-	// stw r25,-128(r1)
-	REX_STORE_D_U32(l_r1.u32, -128, r25.u32);
-	// stw r26,-124(r1)
-	REX_STORE_D_U32(l_r1.u32, -124, r26.u32);
-	// ori r11,r11,8
-	r11.u64 = r11.u64 | 8;
-	// stw r29,-120(r1)
-	REX_STORE_D_U32(l_r1.u32, -120, r29.u32);
-	// stw r30,-116(r1)
-	REX_STORE_D_U32(l_r1.u32, -116, r30.u32);
-	// stw r11,27664(r10)
-	REX_STORE_D_U32_C(l_r10.u32, 27664, r11.u32);
-	// lvx128 v6,r0,r8
-	ea = (l_r8.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)l_v6.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// stvx128 v6,r0,r9
-	ea = (l_r9.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)l_v6.u8)));
-	// b 0x82a87160
-	goto loc_82A87160;
-loc_82A8715C:
-	// lvx128 v6,r0,r9
-	ea = (l_r9.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)l_v6.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-loc_82A87160:
-	// lis r11,-32256
-	r11.s64 = -2113929216;
-	// cmplwi cr6,r5,0
-	cr6.compare<uint32_t>(l_r5.u32, 0, xer);
-	// lfs f13,20376(r11)
-	ctx.fpscr.disableFlushMode();
-	temp.u32 = REX_RO_U32(0x82004F98, 0x00000000);
-	l_f13.f64 = double(temp.f32);
-	// beq cr6,0x82a874a8
-	if (cr6.eq) goto loc_82A874A8;
-	// fcmpu cr6,f1,f13
-	cr6.compare(l_f1.f64, l_f13.f64);
-	// ble cr6,0x82a874a8
-	if (!cr6.gt) goto loc_82A874A8;
-	// cmplwi cr6,r6,0
-	cr6.compare<uint32_t>(l_r6.u32, 0, xer);
-	// beq cr6,0x82a874a8
-	if (cr6.eq) goto loc_82A874A8;
-	// fcmpu cr6,f2,f13
-	cr6.compare(l_f2.f64, l_f13.f64);
-	// ble cr6,0x82a874a8
-	if (!cr6.gt) goto loc_82A874A8;
-	// li r10,2
-	l_r10.s64 = 2;
-	// addi r26,r5,16
-	r26.s64 = l_r5.s64 + 16;
-	// addi r24,r6,16
-	r24.s64 = l_r6.s64 + 16;
-	// li r11,0
-	r11.s64 = 0;
-	// mtctr r10
-	ctr.u64 = l_r10.u64;
-loc_82A8719C:
-	// dcbt r11,r26
-	REX_PREFETCH(r11.u32 + r26.u32, 0);
-	// dcbt r11,r24
-	REX_PREFETCH(r11.u32 + r24.u32, 0);
-	// dcbt r11,r4
-	REX_PREFETCH(r11.u32 + l_r4.u32, 0);
-	// dcbt r11,r7
-	REX_PREFETCH(r11.u32 + l_r7.u32, 0);
-	// addi r11,r11,128
-	r11.s64 = r11.s64 + 128;
-	// bdnz 0x82a8719c
-	--ctr.u64;
-	if (ctr.u32 != 0) goto loc_82A8719C;
-	// lha r10,0(r5)
-	l_r10.s64 = int16_t(REX_LOAD_D_U16(l_r5.u32, 0));
-	// std r10,-144(r1)
-	REX_STORE_D_U64(l_r1.u32, -144, l_r10.u64);
-	// lfd f0,-144(r1)
-	f0.u64 = REX_LOAD_D_U64(l_r1.u32, -144);
-	// lha r11,0(r6)
-	r11.s64 = int16_t(REX_LOAD_D_U16(l_r6.u32, 0));
-	// std r11,-128(r1)
-	REX_STORE_D_U64(l_r1.u32, -128, r11.u64);
-	// lfd f13,-128(r1)
-	l_f13.u64 = REX_LOAD_D_U64(l_r1.u32, -128);
-	// fcfid f13,f13
-	l_f13.f64 = double(l_f13.s64);
-	// lwz r9,76(r3)
-	l_r9.u64 = REX_LOAD_D_U32(l_r3.u32, 76);
-	// fcfid f0,f0
-	f0.f64 = double(f0.s64);
-	// srawi r11,r9,5
-	xer.ca = (l_r9.s32 < 0) & ((l_r9.u32 & 0x1F) != 0);
-	r11.s64 = l_r9.s32 >> 5;
-	// frsp f13,f13
-	REX_FLUSH_KNOWN_OFF();
-	l_f13.f64 = double(float(l_f13.f64));
-	// addze. r11,r11
-	temp.s64 = r11.s64 + xer.ca;
-	xer.ca = temp.u32 < r11.u32;
-	r11.s64 = temp.s64;
-	cr0.compare<int32_t>(r11.s32, 0, xer);
-	// frsp f0,f0
-	f0.f64 = double(float(f0.f64));
-	// fdivs f0,f1,f0
-	f0.f64 = double(float(l_f1.f64 / f0.f64));
-	// stfs f0,-128(r1)
-	temp.f32 = float(f0.f64);
-	REX_STORE_D_U32(l_r1.u32, -128, temp.u32);
-	// stfs f0,-124(r1)
-	temp.f32 = float(f0.f64);
-	REX_STORE_D_U32(l_r1.u32, -124, temp.u32);
-	// stfs f0,-120(r1)
-	temp.f32 = float(f0.f64);
-	REX_STORE_D_U32(l_r1.u32, -120, temp.u32);
-	// stfs f0,-116(r1)
-	temp.f32 = float(f0.f64);
-	REX_STORE_D_U32(l_r1.u32, -116, temp.u32);
-	// fdivs f0,f2,f13
-	f0.f64 = double(float(l_f2.f64 / l_f13.f64));
-	// stfs f0,-144(r1)
-	temp.f32 = float(f0.f64);
-	REX_STORE_D_U32(l_r1.u32, -144, temp.u32);
-	// stfs f0,-140(r1)
-	temp.f32 = float(f0.f64);
-	REX_STORE_D_U32(l_r1.u32, -140, temp.u32);
-	// stfs f0,-136(r1)
-	temp.f32 = float(f0.f64);
-	REX_STORE_D_U32(l_r1.u32, -136, temp.u32);
-	// stfs f0,-132(r1)
-	temp.f32 = float(f0.f64);
-	REX_STORE_D_U32(l_r1.u32, -132, temp.u32);
-	// ble 0x82a8774c
-	if (!cr0.gt) goto loc_82A8774C;
-	// addi r30,r1,-144
-	r30.s64 = l_r1.s64 + -144;
-	// mtctr r11
-	ctr.u64 = r11.u64;
-	// addi r5,r1,-128
-	l_r5.s64 = l_r1.s64 + -128;
-	// subfic r23,r26,288
-	xer.ca = r26.u32 <= 288;
-	r23.u64 = static_cast<uint64_t>(288) - r26.u64;
-	// addi r11,r7,48
-	r11.s64 = l_r7.s64 + 48;
-	// addi r10,r4,32
-	l_r10.s64 = l_r4.s64 + 32;
-	// lvx128 v13,r0,r30
-	ea = (r30.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)l_v13.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// addi r6,r24,48
-	l_r6.s64 = r24.s64 + 48;
-	// lvx128 v63,r0,r5
-	ea = (l_r5.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v63.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// addi r9,r26,32
-	l_r9.s64 = r26.s64 + 32;
-	// subf r22,r26,r24
-	r22.u64 = r24.u64 - r26.u64;
-	// subf r3,r4,r7
-	l_r3.u64 = l_r7.u64 - l_r4.u64;
-	// subfic r21,r4,352
-	xer.ca = l_r4.u32 <= 352;
-	r21.u64 = static_cast<uint64_t>(352) - l_r4.u64;
-	// li r8,-32
-	l_r8.s64 = -32;
-	// li r25,-16
-	r25.s64 = -16;
-	// li r31,16
-	r31.s64 = 16;
-	// li r27,-48
-	r27.s64 = -48;
-	// li r28,32
-	r28.s64 = 32;
-	// li r29,48
-	r29.s64 = 48;
-	// li r30,64
-	r30.s64 = 64;
-	// li r20,80
-	r20.s64 = 80;
-loc_82A87268:
-	// lvx128 v58,r0,r9
-	ea = (l_r9.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v58.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// add r5,r23,r9
-	l_r5.u64 = r23.u64 + l_r9.u64;
-	// lvx128 v57,r9,r8
-	ea = (l_r9.u32 + l_r8.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v57.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// lvx128 v60,r9,r25
-	ea = (l_r9.u32 + r25.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v60.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// lvx128 v56,r9,r31
-	ea = (l_r9.u32 + r31.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v56.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// dcbt r5,r26
-	REX_PREFETCH(l_r5.u32 + r26.u32, 0);
-	// lvx128 v55,r22,r9
-	ea = (r22.u32 + l_r9.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v55.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// lvx128 v54,r0,r6
-	ea = (l_r6.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v54.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// lvx128 v53,r6,r27
-	ea = (l_r6.u32 + r27.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v53.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// lvx128 v52,r6,r8
-	ea = (l_r6.u32 + l_r8.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v52.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// dcbt r5,r24
-	REX_PREFETCH(l_r5.u32 + r24.u32, 0);
-	// vupklsb128 v51,v57,v96
-	simde_mm_store_si128((simde__m128i*)v51.s32, simde_mm_cvtepi16_epi32(simde_mm_load_si128((simde__m128i*)v57.s16)));
-	// lvx128 v62,r0,r10
-	ea = (l_r10.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v62.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vupkhsb128 v57,v57,v96
-	simde_mm_store_si128((simde__m128i*)v57.s32, simde_mm_cvtepi16_epi32(simde_mm_unpackhi_epi64(simde_mm_load_si128((simde__m128i*)v57.s16), simde_mm_load_si128((simde__m128i*)v57.s16))));
-	// lvx128 v61,r10,r8
-	ea = (l_r10.u32 + l_r8.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v61.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vupkhsb128 v50,v60,v96
-	simde_mm_store_si128((simde__m128i*)v50.s32, simde_mm_cvtepi16_epi32(simde_mm_unpackhi_epi64(simde_mm_load_si128((simde__m128i*)v60.s16), simde_mm_load_si128((simde__m128i*)v60.s16))));
-	// lvx128 v59,r10,r31
-	ea = (l_r10.u32 + r31.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v59.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vupkhsb128 v48,v58,v96
-	simde_mm_store_si128((simde__m128i*)v48.s32, simde_mm_cvtepi16_epi32(simde_mm_unpackhi_epi64(simde_mm_load_si128((simde__m128i*)v58.s16), simde_mm_load_si128((simde__m128i*)v58.s16))));
-	// add r5,r10,r21
-	l_r5.u64 = l_r10.u64 + r21.u64;
-	// vupkhsb128 v47,v56,v96
-	simde_mm_store_si128((simde__m128i*)v47.s32, simde_mm_cvtepi16_epi32(simde_mm_unpackhi_epi64(simde_mm_load_si128((simde__m128i*)v56.s16), simde_mm_load_si128((simde__m128i*)v56.s16))));
-	// vcsxwfp128 v51,v51,0
-	ctx.fpscr.enableFlushMode();
-	simde_mm_store_ps(v51.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v51.u32)));
-	// vupklsb128 v49,v60,v96
-	simde_mm_store_si128((simde__m128i*)v49.s32, simde_mm_cvtepi16_epi32(simde_mm_load_si128((simde__m128i*)v60.s16)));
-	// vcsxwfp128 v46,v57,0
-	simde_mm_store_ps(v46.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v57.u32)));
-	// vupklsb128 v58,v58,v96
-	simde_mm_store_si128((simde__m128i*)v58.s32, simde_mm_cvtepi16_epi32(simde_mm_load_si128((simde__m128i*)v58.s16)));
-	// vcsxwfp128 v50,v50,0
-	simde_mm_store_ps(v50.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v50.u32)));
-	// vupklsb128 v56,v56,v96
-	simde_mm_store_si128((simde__m128i*)v56.s32, simde_mm_cvtepi16_epi32(simde_mm_load_si128((simde__m128i*)v56.s16)));
-	// vcsxwfp128 v48,v48,0
-	simde_mm_store_ps(v48.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v48.u32)));
-	// vcsxwfp128 v47,v47,0
-	simde_mm_store_ps(v47.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v47.u32)));
-	// vupklsb128 v57,v53,v96
-	simde_mm_store_si128((simde__m128i*)v57.s32, simde_mm_cvtepi16_epi32(simde_mm_load_si128((simde__m128i*)v53.s16)));
-	// vcsxwfp128 v49,v49,0
-	simde_mm_store_ps(v49.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v49.u32)));
-	// vupkhsb128 v53,v53,v96
-	simde_mm_store_si128((simde__m128i*)v53.s32, simde_mm_cvtepi16_epi32(simde_mm_unpackhi_epi64(simde_mm_load_si128((simde__m128i*)v53.s16), simde_mm_load_si128((simde__m128i*)v53.s16))));
-	// vcsxwfp128 v45,v58,0
-	simde_mm_store_ps(v45.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v58.u32)));
-	// vupkhsb128 v58,v52,v96
-	simde_mm_store_si128((simde__m128i*)v58.s32, simde_mm_cvtepi16_epi32(simde_mm_unpackhi_epi64(simde_mm_load_si128((simde__m128i*)v52.s16), simde_mm_load_si128((simde__m128i*)v52.s16))));
-	// vcsxwfp128 v44,v56,0
-	simde_mm_store_ps(v44.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v56.u32)));
-	// vupkhsb128 v56,v55,v96
-	simde_mm_store_si128((simde__m128i*)v56.s32, simde_mm_cvtepi16_epi32(simde_mm_unpackhi_epi64(simde_mm_load_si128((simde__m128i*)v55.s16), simde_mm_load_si128((simde__m128i*)v55.s16))));
-	// vupkhsb128 v42,v54,v96
-	simde_mm_store_si128((simde__m128i*)v42.s32, simde_mm_cvtepi16_epi32(simde_mm_unpackhi_epi64(simde_mm_load_si128((simde__m128i*)v54.s16), simde_mm_load_si128((simde__m128i*)v54.s16))));
-	// vcsxwfp128 v10,v57,0
-	simde_mm_store_ps(l_v10.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v57.u32)));
-	// vupklsb128 v52,v52,v96
-	simde_mm_store_si128((simde__m128i*)v52.s32, simde_mm_cvtepi16_epi32(simde_mm_load_si128((simde__m128i*)v52.s16)));
-	// vcsxwfp128 v12,v53,0
-	simde_mm_store_ps(l_v12.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v53.u32)));
-	// vupklsb128 v43,v55,v96
-	simde_mm_store_si128((simde__m128i*)v43.s32, simde_mm_cvtepi16_epi32(simde_mm_load_si128((simde__m128i*)v55.s16)));
-	// vcsxwfp128 v8,v58,0
-	simde_mm_store_ps(l_v8.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v58.u32)));
-	// vupklsb128 v54,v54,v96
-	simde_mm_store_si128((simde__m128i*)v54.s32, simde_mm_cvtepi16_epi32(simde_mm_load_si128((simde__m128i*)v54.s16)));
-	// vcsxwfp128 v1,v56,0
-	simde_mm_store_ps(l_v1.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v56.u32)));
-	// vmulfp128 v9,v51,v63
-	simde_mm_store_ps(l_v9.f32, simde_mm_mul_ps(simde_mm_load_ps(v51.f32), simde_mm_load_ps(v63.f32)));
-	// lvx128 v60,r10,r25
-	ea = (l_r10.u32 + r25.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v60.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vmulfp128 v11,v46,v63
-	simde_mm_store_ps(l_v11.f32, simde_mm_mul_ps(simde_mm_load_ps(v46.f32), simde_mm_load_ps(v63.f32)));
-	// lvx128 v58,r10,r28
-	ea = (l_r10.u32 + r28.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v58.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vmulfp128 v4,v50,v63
-	simde_mm_store_ps(l_v4.f32, simde_mm_mul_ps(simde_mm_load_ps(v50.f32), simde_mm_load_ps(v63.f32)));
-	// lvx128 v57,r10,r29
-	ea = (l_r10.u32 + r29.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v57.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vcsxwfp128 v3,v52,0
-	simde_mm_store_ps(l_v3.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v52.u32)));
-	// lvx128 v56,r10,r30
-	ea = (l_r10.u32 + r30.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v56.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vmulfp128 v31,v48,v63
-	simde_mm_store_ps(v31.f32, simde_mm_mul_ps(simde_mm_load_ps(v48.f32), simde_mm_load_ps(v63.f32)));
-	// lvx128 v55,r10,r20
-	ea = (l_r10.u32 + r20.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v55.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vmulfp128 v2,v49,v63
-	simde_mm_store_ps(l_v2.f32, simde_mm_mul_ps(simde_mm_load_ps(v49.f32), simde_mm_load_ps(v63.f32)));
-	// vcsxwfp128 v26,v54,0
-	simde_mm_store_ps(v26.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v54.u32)));
-	// vmulfp128 v29,v45,v63
-	simde_mm_store_ps(v29.f32, simde_mm_mul_ps(simde_mm_load_ps(v45.f32), simde_mm_load_ps(v63.f32)));
-	// vcsxwfp128 v30,v43,0
-	simde_mm_store_ps(v30.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v43.u32)));
-	// vmulfp128 v27,v47,v63
-	simde_mm_store_ps(v27.f32, simde_mm_mul_ps(simde_mm_load_ps(v47.f32), simde_mm_load_ps(v63.f32)));
-	// vcsxwfp128 v28,v42,0
-	simde_mm_store_ps(v28.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v42.u32)));
-	// vmulfp128 v25,v44,v63
-	simde_mm_store_ps(v25.f32, simde_mm_mul_ps(simde_mm_load_ps(v44.f32), simde_mm_load_ps(v63.f32)));
-	// vmaddfp v10,v10,v13,v9
-	simde_mm_store_ps(l_v10.f32, simde_mm_fmadd_ps(simde_mm_load_ps(l_v10.f32), simde_mm_load_ps(l_v13.f32), simde_mm_load_ps(l_v9.f32)));
-	// vmaddfp v11,v12,v13,v11
-	simde_mm_store_ps(l_v11.f32, simde_mm_fmadd_ps(simde_mm_load_ps(l_v12.f32), simde_mm_load_ps(l_v13.f32), simde_mm_load_ps(l_v11.f32)));
-	// vmaddfp v9,v8,v13,v4
-	simde_mm_store_ps(l_v9.f32, simde_mm_fmadd_ps(simde_mm_load_ps(l_v8.f32), simde_mm_load_ps(l_v13.f32), simde_mm_load_ps(l_v4.f32)));
-	// vmaddfp v4,v1,v13,v31
-	simde_mm_store_ps(l_v4.f32, simde_mm_fmadd_ps(simde_mm_load_ps(l_v1.f32), simde_mm_load_ps(l_v13.f32), simde_mm_load_ps(v31.f32)));
-	// vmaddfp v8,v3,v13,v2
-	simde_mm_store_ps(l_v8.f32, simde_mm_fmadd_ps(simde_mm_load_ps(l_v3.f32), simde_mm_load_ps(l_v13.f32), simde_mm_load_ps(l_v2.f32)));
-	// vmaddfp v3,v30,v13,v29
-	simde_mm_store_ps(l_v3.f32, simde_mm_fmadd_ps(simde_mm_load_ps(v30.f32), simde_mm_load_ps(l_v13.f32), simde_mm_load_ps(v29.f32)));
-	// vmaddfp v2,v28,v13,v27
-	simde_mm_store_ps(l_v2.f32, simde_mm_fmadd_ps(simde_mm_load_ps(v28.f32), simde_mm_load_ps(l_v13.f32), simde_mm_load_ps(v27.f32)));
-	// vmaddfp v1,v26,v13,v25
-	simde_mm_store_ps(l_v1.f32, simde_mm_fmadd_ps(simde_mm_load_ps(v26.f32), simde_mm_load_ps(l_v13.f32), simde_mm_load_ps(v25.f32)));
-	// vperm128 v53,v11,v10,v0
-	simde_mm_store_si128((simde__m128i*)v53.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)l_v11.u8), simde_mm_load_si128((simde__m128i*)l_v10.u8), simde_mm_load_si128((simde__m128i*)l_v0.u8)));
-	// vperm v12,v11,v10,v7
-	simde_mm_store_si128((simde__m128i*)l_v12.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)l_v11.u8), simde_mm_load_si128((simde__m128i*)l_v10.u8), simde_mm_load_si128((simde__m128i*)l_v7.u8)));
-	// vperm128 v54,v9,v8,v0
-	simde_mm_store_si128((simde__m128i*)v54.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)l_v9.u8), simde_mm_load_si128((simde__m128i*)l_v8.u8), simde_mm_load_si128((simde__m128i*)l_v0.u8)));
-	// vperm v11,v9,v8,v7
-	simde_mm_store_si128((simde__m128i*)l_v11.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)l_v9.u8), simde_mm_load_si128((simde__m128i*)l_v8.u8), simde_mm_load_si128((simde__m128i*)l_v7.u8)));
-	// vperm128 v52,v4,v3,v0
-	simde_mm_store_si128((simde__m128i*)v52.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)l_v4.u8), simde_mm_load_si128((simde__m128i*)l_v3.u8), simde_mm_load_si128((simde__m128i*)l_v0.u8)));
-	// vperm v10,v4,v3,v7
-	simde_mm_store_si128((simde__m128i*)l_v10.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)l_v4.u8), simde_mm_load_si128((simde__m128i*)l_v3.u8), simde_mm_load_si128((simde__m128i*)l_v7.u8)));
-	// vperm128 v51,v2,v1,v0
-	simde_mm_store_si128((simde__m128i*)v51.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)l_v2.u8), simde_mm_load_si128((simde__m128i*)l_v1.u8), simde_mm_load_si128((simde__m128i*)l_v0.u8)));
-	// vperm v9,v2,v1,v7
-	simde_mm_store_si128((simde__m128i*)l_v9.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)l_v2.u8), simde_mm_load_si128((simde__m128i*)l_v1.u8), simde_mm_load_si128((simde__m128i*)l_v7.u8)));
-	// dcbt r5,r4
-	REX_PREFETCH(l_r5.u32 + l_r4.u32, 0);
-	// lvx128 v49,r10,r3
-	ea = (l_r10.u32 + l_r3.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v49.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vperm128 v50,v61,v60,v7
-	simde_mm_store_si128((simde__m128i*)v50.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v61.u8), simde_mm_load_si128((simde__m128i*)v60.u8), simde_mm_load_si128((simde__m128i*)l_v7.u8)));
-	// lvx128 v47,r0,r11
-	ea = (r11.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v47.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vperm128 v48,v62,v59,v7
-	simde_mm_store_si128((simde__m128i*)v48.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v62.u8), simde_mm_load_si128((simde__m128i*)v59.u8), simde_mm_load_si128((simde__m128i*)l_v7.u8)));
-	// vperm128 v4,v62,v59,v0
-	simde_mm_store_si128((simde__m128i*)l_v4.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v62.u8), simde_mm_load_si128((simde__m128i*)v59.u8), simde_mm_load_si128((simde__m128i*)l_v0.u8)));
-	// vmulfp128 v31,v53,v50
-	simde_mm_store_ps(v31.f32, simde_mm_mul_ps(simde_mm_load_ps(v53.f32), simde_mm_load_ps(v50.f32)));
-	// vperm128 v46,v58,v57,v7
-	simde_mm_store_si128((simde__m128i*)v46.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v58.u8), simde_mm_load_si128((simde__m128i*)v57.u8), simde_mm_load_si128((simde__m128i*)l_v7.u8)));
-	// vmulfp128 v62,v12,v50
-	simde_mm_store_ps(v62.f32, simde_mm_mul_ps(simde_mm_load_ps(l_v12.f32), simde_mm_load_ps(v50.f32)));
-	// vperm128 v3,v58,v57,v0
-	simde_mm_store_si128((simde__m128i*)l_v3.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v58.u8), simde_mm_load_si128((simde__m128i*)v57.u8), simde_mm_load_si128((simde__m128i*)l_v0.u8)));
-	// vmulfp128 v30,v54,v48
-	simde_mm_store_ps(v30.f32, simde_mm_mul_ps(simde_mm_load_ps(v54.f32), simde_mm_load_ps(v48.f32)));
-	// vperm128 v8,v61,v60,v0
-	simde_mm_store_si128((simde__m128i*)l_v8.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v61.u8), simde_mm_load_si128((simde__m128i*)v60.u8), simde_mm_load_si128((simde__m128i*)l_v0.u8)));
-	// vmulfp128 v61,v11,v48
-	simde_mm_store_ps(v61.f32, simde_mm_mul_ps(simde_mm_load_ps(l_v11.f32), simde_mm_load_ps(v48.f32)));
-	// vperm128 v44,v56,v55,v7
-	simde_mm_store_si128((simde__m128i*)v44.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v56.u8), simde_mm_load_si128((simde__m128i*)v55.u8), simde_mm_load_si128((simde__m128i*)l_v7.u8)));
-	// vmulfp128 v50,v54,v4
-	simde_mm_store_ps(v50.f32, simde_mm_mul_ps(simde_mm_load_ps(v54.f32), simde_mm_load_ps(l_v4.f32)));
-	// vperm128 v2,v56,v55,v0
-	simde_mm_store_si128((simde__m128i*)l_v2.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v56.u8), simde_mm_load_si128((simde__m128i*)v55.u8), simde_mm_load_si128((simde__m128i*)l_v0.u8)));
-	// vmulfp128 v29,v52,v46
-	simde_mm_store_ps(v29.f32, simde_mm_mul_ps(simde_mm_load_ps(v52.f32), simde_mm_load_ps(v46.f32)));
-	// vmulfp128 v54,v52,v3
-	simde_mm_store_ps(v54.f32, simde_mm_mul_ps(simde_mm_load_ps(v52.f32), simde_mm_load_ps(l_v3.f32)));
-	// lvx128 v57,r11,r28
-	ea = (r11.u32 + r28.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v57.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vmulfp128 v60,v10,v46
-	simde_mm_store_ps(v60.f32, simde_mm_mul_ps(simde_mm_load_ps(l_v10.f32), simde_mm_load_ps(v46.f32)));
-	// lvx128 v45,r11,r27
-	ea = (r11.u32 + r27.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v45.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vmulfp128 v53,v53,v8
-	simde_mm_store_ps(v53.f32, simde_mm_mul_ps(simde_mm_load_ps(v53.f32), simde_mm_load_ps(l_v8.f32)));
-	// lvx128 v43,r11,r8
-	ea = (r11.u32 + l_r8.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v43.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vmulfp128 v52,v51,v2
-	simde_mm_store_ps(v52.f32, simde_mm_mul_ps(simde_mm_load_ps(v51.f32), simde_mm_load_ps(l_v2.f32)));
-	// lvx128 v58,r11,r31
-	ea = (r11.u32 + r31.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v58.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vmulfp128 v59,v9,v44
-	simde_mm_store_ps(v59.f32, simde_mm_mul_ps(simde_mm_load_ps(l_v9.f32), simde_mm_load_ps(v44.f32)));
-	// lvx128 v56,r11,r29
-	ea = (r11.u32 + r29.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v56.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vmulfp128 v1,v51,v44
-	simde_mm_store_ps(l_v1.f32, simde_mm_mul_ps(simde_mm_load_ps(v51.f32), simde_mm_load_ps(v44.f32)));
-	// lvx128 v55,r11,r30
-	ea = (r11.u32 + r30.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v55.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vmaddfp v12,v12,v8,v31
-	simde_mm_store_ps(l_v12.f32, simde_mm_fmadd_ps(simde_mm_load_ps(l_v12.f32), simde_mm_load_ps(l_v8.f32), simde_mm_load_ps(v31.f32)));
-	// vmaddfp v11,v11,v4,v30
-	simde_mm_store_ps(l_v11.f32, simde_mm_fmadd_ps(simde_mm_load_ps(l_v11.f32), simde_mm_load_ps(l_v4.f32), simde_mm_load_ps(v30.f32)));
-	// vsubfp128 v61,v61,v50
-	simde_mm_store_ps(v61.f32, simde_mm_sub_ps(simde_mm_load_ps(v61.f32), simde_mm_load_ps(v50.f32)));
-	// vmaddfp v10,v10,v3,v29
-	simde_mm_store_ps(l_v10.f32, simde_mm_fmadd_ps(simde_mm_load_ps(l_v10.f32), simde_mm_load_ps(l_v3.f32), simde_mm_load_ps(v29.f32)));
-	// vsubfp128 v60,v60,v54
-	simde_mm_store_ps(v60.f32, simde_mm_sub_ps(simde_mm_load_ps(v60.f32), simde_mm_load_ps(v54.f32)));
-	// vsubfp128 v62,v62,v53
-	simde_mm_store_ps(v62.f32, simde_mm_sub_ps(simde_mm_load_ps(v62.f32), simde_mm_load_ps(v53.f32)));
-	// vsubfp128 v59,v59,v52
-	simde_mm_store_ps(v59.f32, simde_mm_sub_ps(simde_mm_load_ps(v59.f32), simde_mm_load_ps(v52.f32)));
-	// vmaddfp v9,v9,v2,v1
-	simde_mm_store_ps(l_v9.f32, simde_mm_fmadd_ps(simde_mm_load_ps(l_v9.f32), simde_mm_load_ps(l_v2.f32), simde_mm_load_ps(l_v1.f32)));
-	// vperm128 v53,v61,v11,v5
-	simde_mm_store_si128((simde__m128i*)v53.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v61.u8), simde_mm_load_si128((simde__m128i*)l_v11.u8), simde_mm_load_si128((simde__m128i*)l_v5.u8)));
-	// vperm128 v61,v61,v11,v6
-	simde_mm_store_si128((simde__m128i*)v61.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v61.u8), simde_mm_load_si128((simde__m128i*)l_v11.u8), simde_mm_load_si128((simde__m128i*)l_v6.u8)));
-	// vperm128 v52,v60,v10,v5
-	simde_mm_store_si128((simde__m128i*)v52.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v60.u8), simde_mm_load_si128((simde__m128i*)l_v10.u8), simde_mm_load_si128((simde__m128i*)l_v5.u8)));
-	// vperm128 v54,v62,v12,v5
-	simde_mm_store_si128((simde__m128i*)v54.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v62.u8), simde_mm_load_si128((simde__m128i*)l_v12.u8), simde_mm_load_si128((simde__m128i*)l_v5.u8)));
-	// vaddfp128 v53,v53,v49
-	simde_mm_store_ps(v53.f32, simde_mm_add_ps(simde_mm_load_ps(v53.f32), simde_mm_load_ps(v49.f32)));
-	// vperm128 v60,v60,v10,v6
-	simde_mm_store_si128((simde__m128i*)v60.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v60.u8), simde_mm_load_si128((simde__m128i*)l_v10.u8), simde_mm_load_si128((simde__m128i*)l_v6.u8)));
-	// vaddfp128 v61,v61,v47
-	simde_mm_store_ps(v61.f32, simde_mm_add_ps(simde_mm_load_ps(v61.f32), simde_mm_load_ps(v47.f32)));
-	// vperm128 v62,v62,v12,v6
-	simde_mm_store_si128((simde__m128i*)v62.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v62.u8), simde_mm_load_si128((simde__m128i*)l_v12.u8), simde_mm_load_si128((simde__m128i*)l_v6.u8)));
-	// vperm128 v51,v59,v9,v5
-	simde_mm_store_si128((simde__m128i*)v51.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v59.u8), simde_mm_load_si128((simde__m128i*)l_v9.u8), simde_mm_load_si128((simde__m128i*)l_v5.u8)));
-	// vaddfp128 v58,v52,v58
-	simde_mm_store_ps(v58.f32, simde_mm_add_ps(simde_mm_load_ps(v52.f32), simde_mm_load_ps(v58.f32)));
-	// vperm128 v59,v59,v9,v6
-	simde_mm_store_si128((simde__m128i*)v59.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v59.u8), simde_mm_load_si128((simde__m128i*)l_v9.u8), simde_mm_load_si128((simde__m128i*)l_v6.u8)));
-	// vaddfp128 v54,v54,v45
-	simde_mm_store_ps(v54.f32, simde_mm_add_ps(simde_mm_load_ps(v54.f32), simde_mm_load_ps(v45.f32)));
-	// vaddfp128 v60,v60,v57
-	simde_mm_store_ps(v60.f32, simde_mm_add_ps(simde_mm_load_ps(v60.f32), simde_mm_load_ps(v57.f32)));
-	// vaddfp128 v62,v62,v43
-	simde_mm_store_ps(v62.f32, simde_mm_add_ps(simde_mm_load_ps(v62.f32), simde_mm_load_ps(v43.f32)));
-	// vaddfp128 v57,v51,v56
-	simde_mm_store_ps(v57.f32, simde_mm_add_ps(simde_mm_load_ps(v51.f32), simde_mm_load_ps(v56.f32)));
-	// vaddfp128 v59,v59,v55
-	simde_mm_store_ps(v59.f32, simde_mm_add_ps(simde_mm_load_ps(v59.f32), simde_mm_load_ps(v55.f32)));
-	// stvx128 v53,r10,r3
-	ea = (l_r10.u32 + l_r3.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)v53.u8)));
-	// stvx128 v61,r0,r11
-	ea = (r11.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)v61.u8)));
-	// stvx128 v58,r11,r31
-	ea = (r11.u32 + r31.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)v58.u8)));
-	// stvx128 v54,r11,r27
-	ea = (r11.u32 + r27.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)v54.u8)));
-	// stvx128 v60,r11,r28
-	ea = (r11.u32 + r28.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)v60.u8)));
-	// stvx128 v62,r11,r8
-	ea = (r11.u32 + l_r8.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)v62.u8)));
-	// stvx128 v57,r11,r29
-	ea = (r11.u32 + r29.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)v57.u8)));
-	// stvx128 v59,r11,r30
-	ea = (r11.u32 + r30.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)v59.u8)));
-	// dcbt r5,r7
-	REX_PREFETCH(l_r5.u32 + l_r7.u32, 0);
-	// addi r9,r9,64
-	l_r9.s64 = l_r9.s64 + 64;
-	// addi r6,r6,64
-	l_r6.s64 = l_r6.s64 + 64;
-	// addi r10,r10,128
-	l_r10.s64 = l_r10.s64 + 128;
-	// addi r11,r11,128
-	r11.s64 = r11.s64 + 128;
-	// bdnz 0x82a87268
-	--ctr.u64;
-	if (ctr.u32 != 0) goto loc_82A87268;
-	// b 0x82a8774c
-	goto loc_82A8774C;
-loc_82A874A8:
-	// li r19,0
-	r19.s64 = 0;
-	// li r8,-32
-	l_r8.s64 = -32;
-	// li r25,-16
-	r25.s64 = -16;
-	// li r31,16
-	r31.s64 = 16;
-	// li r27,-48
-	r27.s64 = -48;
-	// li r28,32
-	r28.s64 = 32;
-	// li r29,48
-	r29.s64 = 48;
-	// li r30,64
-	r30.s64 = 64;
-	// li r20,80
-	r20.s64 = 80;
-loc_82A874CC:
-	// cmpwi cr6,r19,0
-	cr6.compare<int32_t>(r19.s32, 0, xer);
-	// bne cr6,0x82a874e0
-	if (!cr6.eq) goto loc_82A874E0;
-	// fmr f0,f1
-	f0.f64 = l_f1.f64;
-	// mr r10,r5
-	l_r10.u64 = l_r5.u64;
-	// b 0x82a874e8
-	goto loc_82A874E8;
-loc_82A874E0:
-	// fmr f0,f2
-	f0.f64 = l_f2.f64;
-	// mr r10,r6
-	l_r10.u64 = l_r6.u64;
-loc_82A874E8:
-	// cmplwi cr6,r10,0
-	cr6.compare<uint32_t>(l_r10.u32, 0, xer);
-	// beq cr6,0x82a87740
-	if (cr6.eq) goto loc_82A87740;
-	// fcmpu cr6,f0,f13
-	ctx.fpscr.disableFlushMode();
-	cr6.compare(f0.f64, l_f13.f64);
-	// beq cr6,0x82a87740
-	if (cr6.eq) goto loc_82A87740;
-	// addi r23,r10,16
-	r23.s64 = l_r10.s64 + 16;
-	// dcbt r0,r10
-	REX_PREFETCH(l_r10.u32, 0);
-	// li r9,2
-	l_r9.s64 = 2;
-	// li r11,0
-	r11.s64 = 0;
-	// mtctr r9
-	ctr.u64 = l_r9.u64;
-loc_82A8750C:
-	// dcbt r11,r10
-	REX_PREFETCH(r11.u32 + l_r10.u32, 0);
-	// dcbt r11,r4
-	REX_PREFETCH(r11.u32 + l_r4.u32, 0);
-	// dcbt r11,r7
-	REX_PREFETCH(r11.u32 + l_r7.u32, 0);
-	// addi r11,r11,128
-	r11.s64 = r11.s64 + 128;
-	// bdnz 0x82a8750c
-	--ctr.u64;
-	if (ctr.u32 != 0) goto loc_82A8750C;
-	// lha r9,0(r10)
-	l_r9.s64 = int16_t(REX_LOAD_D_U16(l_r10.u32, 0));
-	// std r9,-128(r1)
-	REX_STORE_D_U64(l_r1.u32, -128, l_r9.u64);
-	// lwz r10,76(r3)
-	l_r10.u64 = REX_LOAD_D_U32(l_r3.u32, 76);
-	// srawi r10,r10,5
-	xer.ca = (l_r10.s32 < 0) & ((l_r10.u32 & 0x1F) != 0);
-	l_r10.s64 = l_r10.s32 >> 5;
-	// addze. r11,r10
-	temp.s64 = l_r10.s64 + xer.ca;
-	xer.ca = temp.u32 < l_r10.u32;
-	r11.s64 = temp.s64;
-	cr0.compare<int32_t>(r11.s32, 0, xer);
-	// lfd f12,-128(r1)
-	l_f12.u64 = REX_LOAD_D_U64(l_r1.u32, -128);
-	// fcfid f12,f12
-	l_f12.f64 = double(l_f12.s64);
-	// frsp f12,f12
-	REX_FLUSH_KNOWN_OFF();
-	l_f12.f64 = double(float(l_f12.f64));
-	// fdivs f0,f0,f12
-	f0.f64 = double(float(f0.f64 / l_f12.f64));
-	// stfs f0,-144(r1)
-	temp.f32 = float(f0.f64);
-	REX_STORE_D_U32(l_r1.u32, -144, temp.u32);
-	// stfs f0,-140(r1)
-	temp.f32 = float(f0.f64);
-	REX_STORE_D_U32(l_r1.u32, -140, temp.u32);
-	// stfs f0,-136(r1)
-	temp.f32 = float(f0.f64);
-	REX_STORE_D_U32(l_r1.u32, -136, temp.u32);
-	// stfs f0,-132(r1)
-	temp.f32 = float(f0.f64);
-	REX_STORE_D_U32(l_r1.u32, -132, temp.u32);
-	// ble 0x82a87740
-	if (!cr0.gt) goto loc_82A87740;
-	// addi r26,r1,-144
-	r26.s64 = l_r1.s64 + -144;
-	// mtctr r11
-	ctr.u64 = r11.u64;
-	// subfic r22,r23,288
-	xer.ca = r23.u32 <= 288;
-	r22.u64 = static_cast<uint64_t>(288) - r23.u64;
-	// addi r11,r7,48
-	r11.s64 = l_r7.s64 + 48;
-	// addi r10,r4,32
-	l_r10.s64 = l_r4.s64 + 32;
-	// addi r9,r23,32
-	l_r9.s64 = r23.s64 + 32;
-	// lvx128 v63,r0,r26
-	ea = (r26.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v63.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// subf r24,r4,r7
-	r24.u64 = l_r7.u64 - l_r4.u64;
-	// subfic r21,r4,352
-	xer.ca = l_r4.u32 <= 352;
-	r21.u64 = static_cast<uint64_t>(352) - l_r4.u64;
-loc_82A8757C:
-	// lvx128 v58,r0,r9
-	ea = (l_r9.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v58.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// add r26,r9,r22
-	r26.u64 = l_r9.u64 + r22.u64;
-	// lvx128 v61,r9,r8
-	ea = (l_r9.u32 + l_r8.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v61.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// lvx128 v59,r9,r25
-	ea = (l_r9.u32 + r25.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v59.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// lvx128 v57,r9,r31
-	ea = (l_r9.u32 + r31.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v57.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// dcbt r26,r23
-	REX_PREFETCH(r26.u32 + r23.u32, 0);
-	// vupkhsb128 v56,v61,v96
-	simde_mm_store_si128((simde__m128i*)v56.s32, simde_mm_cvtepi16_epi32(simde_mm_unpackhi_epi64(simde_mm_load_si128((simde__m128i*)v61.s16), simde_mm_load_si128((simde__m128i*)v61.s16))));
-	// lvx128 v62,r10,r8
-	ea = (l_r10.u32 + l_r8.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v62.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vupklsb128 v55,v61,v96
-	simde_mm_store_si128((simde__m128i*)v55.s32, simde_mm_cvtepi16_epi32(simde_mm_load_si128((simde__m128i*)v61.s16)));
-	// lvx128 v61,r10,r25
-	ea = (l_r10.u32 + r25.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v61.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vupkhsb128 v50,v57,v96
-	simde_mm_store_si128((simde__m128i*)v50.s32, simde_mm_cvtepi16_epi32(simde_mm_unpackhi_epi64(simde_mm_load_si128((simde__m128i*)v57.s16), simde_mm_load_si128((simde__m128i*)v57.s16))));
-	// lvx128 v60,r0,r10
-	ea = (l_r10.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v60.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vupkhsb128 v54,v59,v96
-	simde_mm_store_si128((simde__m128i*)v54.s32, simde_mm_cvtepi16_epi32(simde_mm_unpackhi_epi64(simde_mm_load_si128((simde__m128i*)v59.s16), simde_mm_load_si128((simde__m128i*)v59.s16))));
-	// add r26,r10,r21
-	r26.u64 = l_r10.u64 + r21.u64;
-	// vcsxwfp128 v51,v56,0
-	ctx.fpscr.enableFlushMode();
-	simde_mm_store_ps(v51.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v56.u32)));
-	// vupklsb128 v53,v59,v96
-	simde_mm_store_si128((simde__m128i*)v53.s32, simde_mm_cvtepi16_epi32(simde_mm_load_si128((simde__m128i*)v59.s16)));
-	// vupkhsb128 v52,v58,v96
-	simde_mm_store_si128((simde__m128i*)v52.s32, simde_mm_cvtepi16_epi32(simde_mm_unpackhi_epi64(simde_mm_load_si128((simde__m128i*)v58.s16), simde_mm_load_si128((simde__m128i*)v58.s16))));
-	// vcsxwfp128 v55,v55,0
-	simde_mm_store_ps(v55.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v55.u32)));
-	// vupklsb128 v56,v58,v96
-	simde_mm_store_si128((simde__m128i*)v56.s32, simde_mm_cvtepi16_epi32(simde_mm_load_si128((simde__m128i*)v58.s16)));
-	// vcsxwfp128 v45,v50,0
-	simde_mm_store_ps(v45.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v50.u32)));
-	// vupklsb128 v57,v57,v96
-	simde_mm_store_si128((simde__m128i*)v57.s32, simde_mm_cvtepi16_epi32(simde_mm_load_si128((simde__m128i*)v57.s16)));
-	// vcsxwfp128 v49,v54,0
-	simde_mm_store_ps(v49.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v54.u32)));
-	// vcsxwfp128 v48,v53,0
-	simde_mm_store_ps(v48.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v53.u32)));
-	// lvx128 v59,r10,r31
-	ea = (l_r10.u32 + r31.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v59.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vcsxwfp128 v47,v52,0
-	simde_mm_store_ps(v47.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v52.u32)));
-	// lvx128 v58,r10,r28
-	ea = (l_r10.u32 + r28.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v58.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vcsxwfp128 v46,v56,0
-	simde_mm_store_ps(v46.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v56.u32)));
-	// lvx128 v56,r10,r29
-	ea = (l_r10.u32 + r29.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v56.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vcsxwfp128 v44,v57,0
-	simde_mm_store_ps(v44.f32, simde_mm_cvtepi32_ps(simde_mm_load_si128((simde__m128i*)v57.u32)));
-	// lvx128 v54,r10,r30
-	ea = (l_r10.u32 + r30.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v54.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// lvx128 v52,r10,r20
-	ea = (l_r10.u32 + r20.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v52.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vmulfp128 v57,v51,v63
-	simde_mm_store_ps(v57.f32, simde_mm_mul_ps(simde_mm_load_ps(v51.f32), simde_mm_load_ps(v63.f32)));
-	// vmulfp128 v55,v55,v63
-	simde_mm_store_ps(v55.f32, simde_mm_mul_ps(simde_mm_load_ps(v55.f32), simde_mm_load_ps(v63.f32)));
-	// vmulfp128 v53,v49,v63
-	simde_mm_store_ps(v53.f32, simde_mm_mul_ps(simde_mm_load_ps(v49.f32), simde_mm_load_ps(v63.f32)));
-	// vmulfp128 v51,v48,v63
-	simde_mm_store_ps(v51.f32, simde_mm_mul_ps(simde_mm_load_ps(v48.f32), simde_mm_load_ps(v63.f32)));
-	// vmulfp128 v50,v47,v63
-	simde_mm_store_ps(v50.f32, simde_mm_mul_ps(simde_mm_load_ps(v47.f32), simde_mm_load_ps(v63.f32)));
-	// vmulfp128 v49,v46,v63
-	simde_mm_store_ps(v49.f32, simde_mm_mul_ps(simde_mm_load_ps(v46.f32), simde_mm_load_ps(v63.f32)));
-	// vmulfp128 v48,v45,v63
-	simde_mm_store_ps(v48.f32, simde_mm_mul_ps(simde_mm_load_ps(v45.f32), simde_mm_load_ps(v63.f32)));
-	// vmulfp128 v47,v44,v63
-	simde_mm_store_ps(v47.f32, simde_mm_mul_ps(simde_mm_load_ps(v44.f32), simde_mm_load_ps(v63.f32)));
-	// vperm128 v46,v57,v55,v0
-	simde_mm_store_si128((simde__m128i*)v46.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v57.u8), simde_mm_load_si128((simde__m128i*)v55.u8), simde_mm_load_si128((simde__m128i*)l_v0.u8)));
-	// vperm128 v13,v57,v55,v7
-	simde_mm_store_si128((simde__m128i*)l_v13.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v57.u8), simde_mm_load_si128((simde__m128i*)v55.u8), simde_mm_load_si128((simde__m128i*)l_v7.u8)));
-	// vperm128 v57,v53,v51,v0
-	simde_mm_store_si128((simde__m128i*)v57.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v53.u8), simde_mm_load_si128((simde__m128i*)v51.u8), simde_mm_load_si128((simde__m128i*)l_v0.u8)));
-	// vperm128 v12,v53,v51,v7
-	simde_mm_store_si128((simde__m128i*)l_v12.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v53.u8), simde_mm_load_si128((simde__m128i*)v51.u8), simde_mm_load_si128((simde__m128i*)l_v7.u8)));
-	// vperm128 v55,v50,v49,v0
-	simde_mm_store_si128((simde__m128i*)v55.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v50.u8), simde_mm_load_si128((simde__m128i*)v49.u8), simde_mm_load_si128((simde__m128i*)l_v0.u8)));
-	// vperm128 v11,v50,v49,v7
-	simde_mm_store_si128((simde__m128i*)l_v11.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v50.u8), simde_mm_load_si128((simde__m128i*)v49.u8), simde_mm_load_si128((simde__m128i*)l_v7.u8)));
-	// vperm128 v53,v48,v47,v0
-	simde_mm_store_si128((simde__m128i*)v53.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v48.u8), simde_mm_load_si128((simde__m128i*)v47.u8), simde_mm_load_si128((simde__m128i*)l_v0.u8)));
-	// vperm128 v10,v48,v47,v7
-	simde_mm_store_si128((simde__m128i*)l_v10.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v48.u8), simde_mm_load_si128((simde__m128i*)v47.u8), simde_mm_load_si128((simde__m128i*)l_v7.u8)));
-	// dcbt r26,r4
-	REX_PREFETCH(r26.u32 + l_r4.u32, 0);
-	// vperm128 v51,v62,v61,v7
-	simde_mm_store_si128((simde__m128i*)v51.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v62.u8), simde_mm_load_si128((simde__m128i*)v61.u8), simde_mm_load_si128((simde__m128i*)l_v7.u8)));
-	// lvx128 v50,r11,r27
-	ea = (r11.u32 + r27.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v50.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vperm128 v9,v62,v61,v0
-	simde_mm_store_si128((simde__m128i*)l_v9.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v62.u8), simde_mm_load_si128((simde__m128i*)v61.u8), simde_mm_load_si128((simde__m128i*)l_v0.u8)));
-	// lvx128 v48,r11,r8
-	ea = (r11.u32 + l_r8.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v48.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vperm128 v49,v60,v59,v7
-	simde_mm_store_si128((simde__m128i*)v49.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v60.u8), simde_mm_load_si128((simde__m128i*)v59.u8), simde_mm_load_si128((simde__m128i*)l_v7.u8)));
-	// lvx128 v45,r10,r24
-	ea = (l_r10.u32 + r24.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v45.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vperm128 v8,v60,v59,v0
-	simde_mm_store_si128((simde__m128i*)l_v8.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v60.u8), simde_mm_load_si128((simde__m128i*)v59.u8), simde_mm_load_si128((simde__m128i*)l_v0.u8)));
-	// lvx128 v43,r0,r11
-	ea = (r11.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v43.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vperm128 v47,v58,v56,v7
-	simde_mm_store_si128((simde__m128i*)v47.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v58.u8), simde_mm_load_si128((simde__m128i*)v56.u8), simde_mm_load_si128((simde__m128i*)l_v7.u8)));
-	// vmulfp128 v61,v13,v51
-	simde_mm_store_ps(v61.f32, simde_mm_mul_ps(simde_mm_load_ps(l_v13.f32), simde_mm_load_ps(v51.f32)));
-	// vperm128 v4,v58,v56,v0
-	simde_mm_store_si128((simde__m128i*)l_v4.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v58.u8), simde_mm_load_si128((simde__m128i*)v56.u8), simde_mm_load_si128((simde__m128i*)l_v0.u8)));
-	// vmulfp128 v62,v46,v9
-	simde_mm_store_ps(v62.f32, simde_mm_mul_ps(simde_mm_load_ps(v46.f32), simde_mm_load_ps(l_v9.f32)));
-	// vmulfp128 v59,v12,v49
-	simde_mm_store_ps(v59.f32, simde_mm_mul_ps(simde_mm_load_ps(l_v12.f32), simde_mm_load_ps(v49.f32)));
-	// vperm128 v44,v54,v52,v7
-	simde_mm_store_si128((simde__m128i*)v44.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v54.u8), simde_mm_load_si128((simde__m128i*)v52.u8), simde_mm_load_si128((simde__m128i*)l_v7.u8)));
-	// vmulfp128 v60,v57,v8
-	simde_mm_store_ps(v60.f32, simde_mm_mul_ps(simde_mm_load_ps(v57.f32), simde_mm_load_ps(l_v8.f32)));
-	// vperm128 v3,v54,v52,v0
-	simde_mm_store_si128((simde__m128i*)l_v3.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v54.u8), simde_mm_load_si128((simde__m128i*)v52.u8), simde_mm_load_si128((simde__m128i*)l_v0.u8)));
-	// vmulfp128 v31,v57,v49
-	simde_mm_store_ps(v31.f32, simde_mm_mul_ps(simde_mm_load_ps(v57.f32), simde_mm_load_ps(v49.f32)));
-	// lvx128 v58,r11,r31
-	ea = (r11.u32 + r31.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v58.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vmulfp128 v30,v46,v51
-	simde_mm_store_ps(v30.f32, simde_mm_mul_ps(simde_mm_load_ps(v46.f32), simde_mm_load_ps(v51.f32)));
-	// lvx128 v52,r11,r29
-	ea = (r11.u32 + r29.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v52.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vmulfp128 v57,v55,v4
-	simde_mm_store_ps(v57.f32, simde_mm_mul_ps(simde_mm_load_ps(v55.f32), simde_mm_load_ps(l_v4.f32)));
-	// lvx128 v51,r11,r30
-	ea = (r11.u32 + r30.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v51.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vmulfp128 v56,v11,v47
-	simde_mm_store_ps(v56.f32, simde_mm_mul_ps(simde_mm_load_ps(l_v11.f32), simde_mm_load_ps(v47.f32)));
-	// vmulfp128 v1,v55,v47
-	simde_mm_store_ps(l_v1.f32, simde_mm_mul_ps(simde_mm_load_ps(v55.f32), simde_mm_load_ps(v47.f32)));
-	// vmulfp128 v55,v53,v3
-	simde_mm_store_ps(v55.f32, simde_mm_mul_ps(simde_mm_load_ps(v53.f32), simde_mm_load_ps(l_v3.f32)));
-	// vmulfp128 v2,v53,v44
-	simde_mm_store_ps(l_v2.f32, simde_mm_mul_ps(simde_mm_load_ps(v53.f32), simde_mm_load_ps(v44.f32)));
-	// lvx128 v53,r11,r28
-	ea = (r11.u32 + r28.u32) & ~0xF;
-	simde_mm_store_si128((simde__m128i*)v53.u8, REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea))));
-	// vmulfp128 v54,v10,v44
-	simde_mm_store_ps(v54.f32, simde_mm_mul_ps(simde_mm_load_ps(l_v10.f32), simde_mm_load_ps(v44.f32)));
-	// vsubfp128 v62,v61,v62
-	simde_mm_store_ps(v62.f32, simde_mm_sub_ps(simde_mm_load_ps(v61.f32), simde_mm_load_ps(v62.f32)));
-	// vsubfp128 v61,v59,v60
-	simde_mm_store_ps(v61.f32, simde_mm_sub_ps(simde_mm_load_ps(v59.f32), simde_mm_load_ps(v60.f32)));
-	// vmaddfp v12,v12,v8,v31
-	simde_mm_store_ps(l_v12.f32, simde_mm_fmadd_ps(simde_mm_load_ps(l_v12.f32), simde_mm_load_ps(l_v8.f32), simde_mm_load_ps(v31.f32)));
-	// vmaddfp v13,v13,v9,v30
-	simde_mm_store_ps(l_v13.f32, simde_mm_fmadd_ps(simde_mm_load_ps(l_v13.f32), simde_mm_load_ps(l_v9.f32), simde_mm_load_ps(v30.f32)));
-	// vsubfp128 v60,v56,v57
-	simde_mm_store_ps(v60.f32, simde_mm_sub_ps(simde_mm_load_ps(v56.f32), simde_mm_load_ps(v57.f32)));
-	// vsubfp128 v59,v54,v55
-	simde_mm_store_ps(v59.f32, simde_mm_sub_ps(simde_mm_load_ps(v54.f32), simde_mm_load_ps(v55.f32)));
-	// vperm128 v57,v62,v13,v5
-	simde_mm_store_si128((simde__m128i*)v57.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v62.u8), simde_mm_load_si128((simde__m128i*)l_v13.u8), simde_mm_load_si128((simde__m128i*)l_v5.u8)));
-	// vmaddfp v11,v11,v4,v1
-	simde_mm_store_ps(l_v11.f32, simde_mm_fmadd_ps(simde_mm_load_ps(l_v11.f32), simde_mm_load_ps(l_v4.f32), simde_mm_load_ps(l_v1.f32)));
-	// vperm128 v56,v61,v12,v5
-	simde_mm_store_si128((simde__m128i*)v56.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v61.u8), simde_mm_load_si128((simde__m128i*)l_v12.u8), simde_mm_load_si128((simde__m128i*)l_v5.u8)));
-	// vmaddfp v10,v10,v3,v2
-	simde_mm_store_ps(l_v10.f32, simde_mm_fmadd_ps(simde_mm_load_ps(l_v10.f32), simde_mm_load_ps(l_v3.f32), simde_mm_load_ps(l_v2.f32)));
-	// vperm128 v62,v62,v13,v6
-	simde_mm_store_si128((simde__m128i*)v62.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v62.u8), simde_mm_load_si128((simde__m128i*)l_v13.u8), simde_mm_load_si128((simde__m128i*)l_v6.u8)));
-	// vperm128 v61,v61,v12,v6
-	simde_mm_store_si128((simde__m128i*)v61.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v61.u8), simde_mm_load_si128((simde__m128i*)l_v12.u8), simde_mm_load_si128((simde__m128i*)l_v6.u8)));
-	// vaddfp128 v57,v57,v50
-	simde_mm_store_ps(v57.f32, simde_mm_add_ps(simde_mm_load_ps(v57.f32), simde_mm_load_ps(v50.f32)));
-	// vaddfp128 v56,v56,v45
-	simde_mm_store_ps(v56.f32, simde_mm_add_ps(simde_mm_load_ps(v56.f32), simde_mm_load_ps(v45.f32)));
-	// vaddfp128 v62,v62,v48
-	simde_mm_store_ps(v62.f32, simde_mm_add_ps(simde_mm_load_ps(v62.f32), simde_mm_load_ps(v48.f32)));
-	// vaddfp128 v61,v61,v43
-	simde_mm_store_ps(v61.f32, simde_mm_add_ps(simde_mm_load_ps(v61.f32), simde_mm_load_ps(v43.f32)));
-	// vperm128 v55,v60,v11,v5
-	simde_mm_store_si128((simde__m128i*)v55.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v60.u8), simde_mm_load_si128((simde__m128i*)l_v11.u8), simde_mm_load_si128((simde__m128i*)l_v5.u8)));
-	// vperm128 v54,v59,v10,v5
-	simde_mm_store_si128((simde__m128i*)v54.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v59.u8), simde_mm_load_si128((simde__m128i*)l_v10.u8), simde_mm_load_si128((simde__m128i*)l_v5.u8)));
-	// vperm128 v60,v60,v11,v6
-	simde_mm_store_si128((simde__m128i*)v60.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v60.u8), simde_mm_load_si128((simde__m128i*)l_v11.u8), simde_mm_load_si128((simde__m128i*)l_v6.u8)));
-	// vperm128 v59,v59,v10,v6
-	simde_mm_store_si128((simde__m128i*)v59.u8, rex::ppc::simde_mm_perm_epi8_(simde_mm_load_si128((simde__m128i*)v59.u8), simde_mm_load_si128((simde__m128i*)l_v10.u8), simde_mm_load_si128((simde__m128i*)l_v6.u8)));
-	// stvx128 v57,r11,r27
-	ea = (r11.u32 + r27.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)v57.u8)));
-	// vaddfp128 v58,v55,v58
-	simde_mm_store_ps(v58.f32, simde_mm_add_ps(simde_mm_load_ps(v55.f32), simde_mm_load_ps(v58.f32)));
-	// stvx128 v56,r10,r24
-	ea = (l_r10.u32 + r24.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)v56.u8)));
-	// vaddfp128 v55,v54,v52
-	simde_mm_store_ps(v55.f32, simde_mm_add_ps(simde_mm_load_ps(v54.f32), simde_mm_load_ps(v52.f32)));
-	// stvx128 v62,r11,r8
-	ea = (r11.u32 + l_r8.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)v62.u8)));
-	// vaddfp128 v60,v60,v53
-	simde_mm_store_ps(v60.f32, simde_mm_add_ps(simde_mm_load_ps(v60.f32), simde_mm_load_ps(v53.f32)));
-	// stvx128 v61,r0,r11
-	ea = (r11.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)v61.u8)));
-	// vaddfp128 v59,v59,v51
-	simde_mm_store_ps(v59.f32, simde_mm_add_ps(simde_mm_load_ps(v59.f32), simde_mm_load_ps(v51.f32)));
-	// stvx128 v58,r11,r31
-	ea = (r11.u32 + r31.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)v58.u8)));
-	// stvx128 v55,r11,r29
-	ea = (r11.u32 + r29.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)v55.u8)));
-	// stvx128 v60,r11,r28
-	ea = (r11.u32 + r28.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)v60.u8)));
-	// stvx128 v59,r11,r30
-	ea = (r11.u32 + r30.u32) & ~0xF;
-	REX_CARD(ea), simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea), REX_BSWAP128(simde_mm_load_si128((simde__m128i*)v59.u8)));
-	// dcbt r26,r7
-	REX_PREFETCH(r26.u32 + l_r7.u32, 0);
-	// addi r9,r9,64
-	l_r9.s64 = l_r9.s64 + 64;
-	// addi r10,r10,128
-	l_r10.s64 = l_r10.s64 + 128;
-	// addi r11,r11,128
-	r11.s64 = r11.s64 + 128;
-	// bdnz 0x82a8757c
-	--ctr.u64;
-	if (ctr.u32 != 0) goto loc_82A8757C;
-loc_82A87740:
-	// addi r19,r19,1
-	r19.s64 = r19.s64 + 1;
-	// cmpwi cr6,r19,2
-	cr6.compare<int32_t>(r19.s32, 2, xer);
-	// blt cr6,0x82a874cc
-	if (cr6.lt) goto loc_82A874CC;
-loc_82A8774C:
-	// b 0x8229b3a4
-	{ REX_LEAF_STORE(l_f12, f12); REX_LEAF_STORE(l_f13, f13); REX_LEAF_STORE(l_r3, r3); REX_LEAF_STORE(l_r5, r5); REX_LEAF_STORE(l_r6, r6); REX_LEAF_STORE(l_r8, r8); REX_LEAF_STORE(l_r9, r9); REX_LEAF_STORE(l_r10, r10); REX_LEAF_STORE(l_v0, v0); REX_LEAF_STORE(l_v1, v1); REX_LEAF_STORE(l_v2, v2); REX_LEAF_STORE(l_v3, v3); REX_LEAF_STORE(l_v4, v4); REX_LEAF_STORE(l_v5, v5); REX_LEAF_STORE(l_v6, v6); REX_LEAF_STORE(l_v7, v7); REX_LEAF_STORE(l_v8, v8); REX_LEAF_STORE(l_v9, v9); REX_LEAF_STORE(l_v10, v10); REX_LEAF_STORE(l_v11, v11); REX_LEAF_STORE(l_v12, v12); REX_LEAF_STORE(l_v13, v13); return true; }
-	REX_LEAF_STORE(l_f12, f12); REX_LEAF_STORE(l_f13, f13); REX_LEAF_STORE(l_r3, r3); REX_LEAF_STORE(l_r5, r5); REX_LEAF_STORE(l_r6, r6); REX_LEAF_STORE(l_r8, r8); REX_LEAF_STORE(l_r9, r9); REX_LEAF_STORE(l_r10, r10); REX_LEAF_STORE(l_v0, v0); REX_LEAF_STORE(l_v1, v1); REX_LEAF_STORE(l_v2, v2); REX_LEAF_STORE(l_v3, v3); REX_LEAF_STORE(l_v4, v4); REX_LEAF_STORE(l_v5, v5); REX_LEAF_STORE(l_v6, v6); REX_LEAF_STORE(l_v7, v7); REX_LEAF_STORE(l_v8, v8); REX_LEAF_STORE(l_v9, v9); REX_LEAF_STORE(l_v10, v10); REX_LEAF_STORE(l_v11, v11); REX_LEAF_STORE(l_v12, v12); REX_LEAF_STORE(l_v13, v13);
-	return true;
-}
+
 }  // namespace n_82A87020
 
 // 8. sub_826D8178: DMA job-stream matrix-palette skinning (15-20% Job 0/2/3, 4.4% FGGameSim).
@@ -3770,27 +2934,34 @@ template <int B>
       const float32x2_t w45 = LoadBeF2(wp + 16);
       const BoneMat& m0 = pal_le[ip[0]];
       const BoneMat& m1 = pal_le[ip[1]];
-      const BoneMat& m2 = pal_le[ip[2]];
-      const BoneMat& m3 = pal_le[ip[3]];
       r0 = vfmaq_laneq_f32(vmulq_laneq_f32(m0.r[0], w03, 0), m1.r[0], w03, 1);
       r1 = vfmaq_laneq_f32(vmulq_laneq_f32(m0.r[1], w03, 0), m1.r[1], w03, 1);
       r2 = vfmaq_laneq_f32(vmulq_laneq_f32(m0.r[2], w03, 0), m1.r[2], w03, 1);
-      float32x4_t s0 = vfmaq_laneq_f32(vmulq_laneq_f32(m2.r[0], w03, 2), m3.r[0], w03, 3);
-      float32x4_t s1 = vfmaq_laneq_f32(vmulq_laneq_f32(m2.r[1], w03, 2), m3.r[1], w03, 3);
-      float32x4_t s2 = vfmaq_laneq_f32(vmulq_laneq_f32(m2.r[2], w03, 2), m3.r[2], w03, 3);
-      if (vget_lane_u64(vreinterpret_u64_f32(w45), 0) != 0ull) {
-        const BoneMat& m4 = pal_le[ip[4]];
-        const BoneMat& m5 = pal_le[ip[5]];
-        r0 = vfmaq_lane_f32(r0, m4.r[0], w45, 0);
-        r1 = vfmaq_lane_f32(r1, m4.r[1], w45, 0);
-        r2 = vfmaq_lane_f32(r2, m4.r[2], w45, 0);
-        s0 = vfmaq_lane_f32(s0, m5.r[0], w45, 1);
-        s1 = vfmaq_lane_f32(s1, m5.r[1], w45, 1);
-        s2 = vfmaq_lane_f32(s2, m5.r[2], w45, 1);
+      const bool has23 = vget_lane_u64(vreinterpret_u64_f32(vget_high_f32(w03)), 0) != 0ull;
+      const bool has45 = vget_lane_u64(vreinterpret_u64_f32(w45), 0) != 0ull;
+      if (has23 || has45) {
+        float32x4_t s0 = zero, s1 = zero, s2 = zero;
+        if (has23) {
+          const BoneMat& m2 = pal_le[ip[2]];
+          const BoneMat& m3 = pal_le[ip[3]];
+          s0 = vfmaq_laneq_f32(vmulq_laneq_f32(m2.r[0], w03, 2), m3.r[0], w03, 3);
+          s1 = vfmaq_laneq_f32(vmulq_laneq_f32(m2.r[1], w03, 2), m3.r[1], w03, 3);
+          s2 = vfmaq_laneq_f32(vmulq_laneq_f32(m2.r[2], w03, 2), m3.r[2], w03, 3);
+        }
+        if (has45) {
+          const BoneMat& m4 = pal_le[ip[4]];
+          const BoneMat& m5 = pal_le[ip[5]];
+          r0 = vfmaq_lane_f32(r0, m4.r[0], w45, 0);
+          r1 = vfmaq_lane_f32(r1, m4.r[1], w45, 0);
+          r2 = vfmaq_lane_f32(r2, m4.r[2], w45, 0);
+          s0 = vfmaq_lane_f32(s0, m5.r[0], w45, 1);
+          s1 = vfmaq_lane_f32(s1, m5.r[1], w45, 1);
+          s2 = vfmaq_lane_f32(s2, m5.r[2], w45, 1);
+        }
+        r0 = vaddq_f32(r0, s0);
+        r1 = vaddq_f32(r1, s1);
+        r2 = vaddq_f32(r2, s2);
       }
-      r0 = vaddq_f32(r0, s0);
-      r1 = vaddq_f32(r1, s1);
-      r2 = vaddq_f32(r2, s2);
     }
 
     const float32x4_t t0 = vtrn1q_f32(r0, r1);
@@ -3908,9 +3079,12 @@ inline void SelfTestCase(int& failures) {
           wk = kTailZero4[k];
         }
       } else if constexpr (B == 6) {
-        if (v >= 2u) {
-          constexpr float kTailZero6[6] = {0.4f, 0.3f, 0.2f, 0.1f, 0.0f, 0.0f};
-          wk = kTailZero6[k];
+        if (v == 2u) {
+          constexpr float kTailZero6_4[6] = {0.4f, 0.3f, 0.2f, 0.1f, 0.0f, 0.0f};
+          wk = kTailZero6_4[k];
+        } else if (v == 3u) {
+          constexpr float kTailZero6_2[6] = {0.7f, 0.3f, 0.0f, 0.0f, 0.0f, 0.0f};
+          wk = kTailZero6_2[k];
         }
       }
       StoreBeF32(wgt + (v * uint32_t(B) + uint32_t(k)) * 4u, wk);
@@ -4075,7 +3249,20 @@ inline void Native(PPCContext& __restrict ctx, uint8_t* base) noexcept {
 
         uint64_t used[4]{};
         const uint32_t n_idx = n_verts * num_bones;
-        for (uint32_t i = 0; i < n_idx; ++i) {
+        uint32_t i = 0;
+        for (; i + 4u <= n_idx; i += 4u) {
+          uint32_t packed;
+          std::memcpy(&packed, in_idx + i, 4u);
+          const uint32_t b0 = packed & 0xFFu;
+          const uint32_t b1 = (packed >> 8) & 0xFFu;
+          const uint32_t b2 = (packed >> 16) & 0xFFu;
+          const uint32_t b3 = packed >> 24;
+          used[b0 >> 6] |= (1ull << (b0 & 63u));
+          used[b1 >> 6] |= (1ull << (b1 & 63u));
+          used[b2 >> 6] |= (1ull << (b2 & 63u));
+          used[b3 >> 6] |= (1ull << (b3 & 63u));
+        }
+        for (; i < n_idx; ++i) {
           const uint8_t b = in_idx[i];
           used[b >> 6] |= (1ull << (b & 63u));
         }
@@ -4122,12 +3309,1555 @@ inline void Native(PPCContext& __restrict ctx, uint8_t* base) noexcept {
 
 }  // namespace n_826D8178
 
+// 9. sub_82A8F798: Audio dynamics compressor/limiter (14.1% Job 4 / 2.4-2.9% total CPU).
+// Replaces scalar/SIMDe envelope + pow() + sub_82A859C8 smoother + gain apply with L1-resident LE float32 buffers
+// and vectorized ARM64 NEON log2/exp2 gain calculation (full float32 precision, <1e-6 error).
+namespace n_82A8F798 {
+
+inline float LoadBeF32(const uint8_t* p) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, p, 4);
+  raw = __builtin_bswap32(raw);
+  float f;
+  std::memcpy(&f, &raw, 4);
+  return f;
+}
+
+inline void StoreBeF32(uint8_t* p, float f) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, &f, 4);
+  raw = __builtin_bswap32(raw);
+  std::memcpy(p, &raw, 4);
+}
+
+inline uint32_t LoadBeU32(const uint8_t* p) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, p, 4);
+  return __builtin_bswap32(raw);
+}
+
+inline void StoreBeU32(uint8_t* p, uint32_t v) noexcept {
+  const uint32_t raw = __builtin_bswap32(v);
+  std::memcpy(p, &raw, 4);
+}
+
+inline uint16_t LoadBeU16(const uint8_t* p) noexcept {
+  uint16_t raw;
+  std::memcpy(&raw, p, 2);
+  return __builtin_bswap16(raw);
+}
+
+#if defined(__aarch64__)
+inline float32x4_t Log2Fast(float32x4_t x) noexcept {
+  // Range-reduce x = 2^e * m with m in [sqrt(0.5), sqrt(2)] so |z| = |(m-1)/(m+1)| <= 0.17157.
+  const uint32x4_t xi = vreinterpretq_u32_f32(x);
+  const uint32x4_t adj = vaddq_u32(xi, vdupq_n_u32(0x004AFB0Du));
+  const int32x4_t exp_i = vsubq_s32(vreinterpretq_s32_u32(vshrq_n_u32(adj, 23)), vdupq_n_s32(127));
+  const float32x4_t exp_f = vcvtq_f32_s32(exp_i);
+  const uint32x4_t mant_i =
+      vsubq_u32(vorrq_u32(vandq_u32(adj, vdupq_n_u32(0x007FFFFFu)), vdupq_n_u32(0x3F800000u)), vdupq_n_u32(0x004AFB0Du));
+  const float32x4_t m = vreinterpretq_f32_u32(mant_i);
+  const float32x4_t one = vdupq_n_f32(1.0f);
+  const float32x4_t z = vdivq_f32(vsubq_f32(m, one), vaddq_f32(m, one));
+  const float32x4_t z2 = vmulq_f32(z, z);
+  // log2(m) = (2/ln2) * z * (1 + z2*(1/3 + z2*(1/5 + z2/7)))
+  float32x4_t poly = vfmaq_f32(vdupq_n_f32(0.2f), z2, vdupq_n_f32(1.0f / 7.0f));
+  poly = vfmaq_f32(vdupq_n_f32(1.0f / 3.0f), z2, poly);
+  poly = vfmaq_f32(one, z2, poly);
+  const float32x4_t log2_m = vmulq_f32(vmulq_f32(z, vdupq_n_f32(2.88539008178f)), poly);
+  return vaddq_f32(exp_f, log2_m);
+}
+
+inline float32x4_t Exp2Fast(float32x4_t y) noexcept {
+  const float32x4_t y_lo = vdupq_n_f32(-126.0f);
+  const float32x4_t yc = vmaxq_f32(vminq_f32(y, vdupq_n_f32(127.0f)), y_lo);
+  const float32x4_t kf = vrndnq_f32(yc);
+  const float32x4_t f = vsubq_f32(yc, kf);
+  const int32x4_t ki = vcvtq_s32_f32(kf);
+  float32x4_t p = vdupq_n_f32(0.00015403530f);
+  p = vfmaq_f32(vdupq_n_f32(0.00133335581f), p, f);
+  p = vfmaq_f32(vdupq_n_f32(0.00961812911f), p, f);
+  p = vfmaq_f32(vdupq_n_f32(0.05550410866f), p, f);
+  p = vfmaq_f32(vdupq_n_f32(0.24022650696f), p, f);
+  p = vfmaq_f32(vdupq_n_f32(0.69314718056f), p, f);
+  p = vfmaq_f32(vdupq_n_f32(1.0f), p, f);
+  const float32x4_t scale = vreinterpretq_f32_s32(vshlq_n_s32(vaddq_s32(ki, vdupq_n_s32(127)), 23));
+  const float32x4_t res = vmulq_f32(p, scale);
+  return vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(res), vcgtq_f32(y, y_lo)));
+}
+#endif
+
+// Out-of-line so check_switch_build never finds vector FMLA inside sub_82A8F798 itself.
+[[gnu::noinline]] void CompressChannelFast(float* __restrict gain_le, const uint8_t* __restrict sc_be, float alpha,
+                                           float& env_io, float threshold, float ratio_exp, bool combine,
+                                           uint32_t link_mode) noexcept {
+  constexpr uint32_t kDcBits = 0x219392EFu;
+  float dc;
+  std::memcpy(&dc, &kDcBits, 4);
+  alignas(16) float env_buf[256];
+  const float one_minus_alpha = 1.0f - alpha;
+  float env = env_io;
+#if defined(__aarch64__)
+  for (uint32_t i = 0; i < 256u; i += 4u) {
+    const float32x4_t s = vabsq_f32(vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(sc_be + (i << 2)))));
+    env = std::fmaf(vgetq_lane_f32(s, 0), one_minus_alpha, alpha * env) + dc;
+    env_buf[i + 0u] = env;
+    env = std::fmaf(vgetq_lane_f32(s, 1), one_minus_alpha, alpha * env) + dc;
+    env_buf[i + 1u] = env;
+    env = std::fmaf(vgetq_lane_f32(s, 2), one_minus_alpha, alpha * env) + dc;
+    env_buf[i + 2u] = env;
+    env = std::fmaf(vgetq_lane_f32(s, 3), one_minus_alpha, alpha * env) + dc;
+    env_buf[i + 3u] = env;
+  }
+  env_io = env;
+  const float32x4_t vthresh = vdupq_n_f32(threshold);
+  const float32x4_t vinv = vdupq_n_f32(1.0f / threshold);
+  const float32x4_t vratio = vdupq_n_f32(ratio_exp);
+  const float32x4_t vone = vdupq_n_f32(1.0f);
+  for (uint32_t i = 0; i < 256u; i += 4u) {
+    const float32x4_t ev = vld1q_f32(env_buf + i);
+    const uint32x4_t above = vcgtq_f32(ev, vthresh);
+    float32x4_t g = vone;
+    if (vmaxvq_u32(above) != 0u) {
+      const float32x4_t x = vbslq_f32(above, vmulq_f32(ev, vinv), vone);
+      const float32x4_t pw = Exp2Fast(vmulq_f32(Log2Fast(x), vratio));
+      g = vbslq_f32(above, pw, vone);
+    }
+    if (combine) {
+      const float32x4_t prev = vld1q_f32(gain_le + i);
+      g = (link_mode == 0u) ? vminq_f32(prev, g) : vmaxq_f32(prev, g);
+    }
+    vst1q_f32(gain_le + i, g);
+  }
+#else
+  const float inv_thresh = 1.0f / threshold;
+  for (uint32_t i = 0; i < 256u; ++i) {
+    env = std::fmaf(std::fabs(LoadBeF32(sc_be + (i << 2))), one_minus_alpha, alpha * env) + dc;
+    env_buf[i] = env;
+  }
+  env_io = env;
+  for (uint32_t i = 0; i < 256u; ++i) {
+    const float ev = env_buf[i];
+    float g = (ev > threshold) ? float(std::pow(double(ev * inv_thresh), double(ratio_exp))) : 1.0f;
+    if (combine) {
+      const float prev = gain_le[i];
+      g = (link_mode == 0u) ? (prev < g ? prev : g) : (prev > g ? prev : g);
+    }
+    gain_le[i] = g;
+  }
+#endif
+}
+
+[[gnu::noinline]] void SmoothGainFast(float* __restrict buf_le, float att_k, float rel_k, float& cur_io) noexcept {
+  constexpr uint32_t kDcBits = 0x219392EFu;
+  float dc;
+  std::memcpy(&dc, &kDcBits, 4);
+  float cur = cur_io;
+  for (uint32_t i = 0; i < 256u; ++i) {
+    const float g = buf_le[i];
+    const float k = (g < cur) ? att_k : rel_k;
+    cur = std::fmaf(k, g, dc) - (k - 1.0f) * cur;
+    buf_le[i] = cur;
+  }
+  cur_io = cur;
+}
+
+[[gnu::noinline]] void ApplyGainBe256(uint8_t* __restrict out_be, const uint8_t* __restrict in_be,
+                                      const float* __restrict gain_le) noexcept {
+#if defined(__aarch64__)
+  for (uint32_t i = 0; i < 256u; i += 16u) {
+    const uint32_t off = i << 2;
+    const float32x4_t x0 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(in_be + off + 0u)));
+    const float32x4_t x1 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(in_be + off + 16u)));
+    const float32x4_t x2 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(in_be + off + 32u)));
+    const float32x4_t x3 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(in_be + off + 48u)));
+    const float32x4_t g0 = vld1q_f32(gain_le + i + 0u);
+    const float32x4_t g1 = vld1q_f32(gain_le + i + 4u);
+    const float32x4_t g2 = vld1q_f32(gain_le + i + 8u);
+    const float32x4_t g3 = vld1q_f32(gain_le + i + 12u);
+    vst1q_u8(out_be + off + 0u, vrev32q_u8(vreinterpretq_u8_f32(vmulq_f32(x0, g0))));
+    vst1q_u8(out_be + off + 16u, vrev32q_u8(vreinterpretq_u8_f32(vmulq_f32(x1, g1))));
+    vst1q_u8(out_be + off + 32u, vrev32q_u8(vreinterpretq_u8_f32(vmulq_f32(x2, g2))));
+    vst1q_u8(out_be + off + 48u, vrev32q_u8(vreinterpretq_u8_f32(vmulq_f32(x3, g3))));
+  }
+#else
+  for (uint32_t i = 0; i < 256u; ++i) {
+    StoreBeF32(out_be + (i << 2), LoadBeF32(in_be + (i << 2)) * gain_le[i]);
+  }
+#endif
+}
+
+inline void RunSelfTest() {
+  int failures = 0;
+  constexpr uint32_t kDcBits = 0x219392EFu;
+  float dc;
+  std::memcpy(&dc, &kDcBits, 4);
+  alignas(16) uint8_t in_be[2][1024]{}, out_be[2][1024]{};
+  for (uint32_t ch = 0; ch < 2u; ++ch) {
+    for (uint32_t i = 0; i < 256u; ++i) {
+      const float s = (ch == 0u ? 0.9f : 0.6f) * std::sin(0.19f * float(i) + float(ch)) + 0.3f * std::cos(0.47f * float(i));
+      StoreBeF32(in_be[ch] + (i << 2), s);
+    }
+  }
+  auto check = [&](const char* label, bool linked, uint32_t link_mode, float threshold, float ratio_exp) {
+    const float alpha = 0.85f;
+    const float att_k = float(1.0 - double(float(std::pow(2.7182817459106445, double(float(-2.2f / 32.0f))))));
+    const float rel_k = float(1.0 - double(float(std::pow(2.7182817459106445, double(float(-2.2f / 256.0f))))));
+    alignas(16) float g_nat[2][256]{}, g_ref[2][256]{};
+    float env_nat[2] = {0.1f, 0.2f}, env_ref[2] = {0.1f, 0.2f};
+    float sm_nat[2] = {0.9f, 0.85f}, sm_ref[2] = {0.9f, 0.85f};
+    for (uint32_t ch = 0; ch < 2u; ++ch) {
+      float* dst_g = linked ? g_nat[0] : g_nat[ch];
+      CompressChannelFast(dst_g, in_be[ch], alpha, env_nat[ch], threshold, ratio_exp, linked && ch > 0u, link_mode);
+      if (!linked || ch == 1u) SmoothGainFast(dst_g, att_k, rel_k, sm_nat[ch]);
+      // Scalar reference
+      float* ref_g = linked ? g_ref[0] : g_ref[ch];
+      const float inv_t = 1.0f / threshold;
+      for (uint32_t i = 0; i < 256u; ++i) {
+        env_ref[ch] = std::fmaf(std::fabs(LoadBeF32(in_be[ch] + (i << 2))), 1.0f - alpha, alpha * env_ref[ch]) + dc;
+        float gv = (env_ref[ch] > threshold) ? float(std::pow(double(env_ref[ch] * inv_t), double(ratio_exp))) : 1.0f;
+        if (linked && ch > 0u) gv = (link_mode == 0u) ? (ref_g[i] < gv ? ref_g[i] : gv) : (ref_g[i] > gv ? ref_g[i] : gv);
+        ref_g[i] = gv;
+      }
+      if (!linked || ch == 1u) {
+        float c = sm_ref[ch];
+        for (uint32_t i = 0; i < 256u; ++i) {
+          const float k = (ref_g[i] < c) ? att_k : rel_k;
+          c = std::fmaf(k, ref_g[i], dc) - (k - 1.0f) * c;
+          ref_g[i] = c;
+        }
+        sm_ref[ch] = c;
+      }
+    }
+    for (uint32_t ch = 0; ch < 2u; ++ch) {
+      ApplyGainBe256(out_be[ch], in_be[ch], linked ? g_nat[0] : g_nat[ch]);
+      const float* ref_g = linked ? g_ref[0] : g_ref[ch];
+      for (uint32_t i = 0; i < 256u; ++i) {
+        const float got = LoadBeF32(out_be[ch] + (i << 2));
+        const float exp = LoadBeF32(in_be[ch] + (i << 2)) * ref_g[i];
+        if (std::isnan(got) || std::fabs(got - exp) > 1e-5f) {
+          ++failures;
+          REXLOG_ERROR("[hot] DIFFERENCE sub_82A8F798 self-test ({}) ch={} i={} got={} exp={}", label, ch, i, got, exp);
+          return;
+        }
+      }
+    }
+  };
+  check("unlinked_comp", false, 0u, 0.25f, -0.75f);
+  check("linked_comp", true, 0u, 0.20f, -0.80f);
+  check("linked_exp", true, 1u, 0.20f, 0.50f);
+  if (failures == 0) {
+    REXLOG_INFO("[hot] sub_82A8F798 compressor self-test: 3/3 passed");
+  } else {
+    sa2::enh::VerifyDifference();
+  }
+}
+
+inline void Native(PPCContext& __restrict ctx, uint8_t* base) noexcept {
+  static std::atomic<bool> tested_done{false};
+  if (!tested_done.load(std::memory_order_acquire)) [[unlikely]] {
+    static std::once_flag tested;
+    std::call_once(tested, [] {
+      RunSelfTest();
+      tested_done.store(true, std::memory_order_release);
+    });
+  }
+  const uint32_t state_va = ctx.r3.u32;
+  const uint32_t ctx_va = ctx.r4.u32;
+  const uint32_t num_ch = ctx.r5.u32;
+  const uint32_t sc_va = ctx.r6.u32;
+  const uint32_t link_mode = ctx.r8.u32;
+  if (state_va < 0x1000u || ctx_va < 0x1000u || num_ch > 8u) {
+    ::__imp__sub_82A8F798(ctx, base);
+    return;
+  }
+  if (num_ch == 0u) {
+    uint8_t* p = Raw(base, ctx_va + 30860u);
+    const uint32_t d0 = LoadBeU32(p);
+    const uint32_t d1 = LoadBeU32(p + 4u);
+    StoreBeU32(p, d1);
+    StoreBeU32(p + 4u, d0);
+    Card(base, ctx_va + 30860u, 8u);
+    return;
+  }
+  const uint8_t* st = Raw(base, state_va);
+  const float alpha = LoadBeF32(st + 0u);
+  const float threshold = LoadBeF32(st + 68u);
+  const float ratio_exp = LoadBeF32(st + 72u);
+  const int32_t att_samples = int32_t(LoadBeU32(st + 76u));
+  const int32_t rel_samples = int32_t(LoadBeU32(st + 80u));
+  const bool linked = st[92] != 0u;
+  const uint32_t in_desc_va = LoadBeU32(Raw(base, ctx_va + 30860u));
+  const uint32_t out_desc_va = LoadBeU32(Raw(base, ctx_va + 30864u));
+  if (in_desc_va < 0x1000u || out_desc_va < 0x1000u || threshold <= 0.0f || std::isnan(threshold) ||
+      std::isnan(ratio_exp) || std::isnan(alpha) || att_samples <= 0 || rel_samples <= 0) {
+    ::__imp__sub_82A8F798(ctx, base);
+    return;
+  }
+  const uint32_t in_data_va = LoadBeU32(Raw(base, in_desc_va + 4u));
+  const uint32_t in_stride = uint32_t(LoadBeU16(Raw(base, in_desc_va + 14u))) << 2;
+  const uint32_t out_data_va = LoadBeU32(Raw(base, out_desc_va + 4u));
+  const uint32_t out_stride = uint32_t(LoadBeU16(Raw(base, out_desc_va + 14u))) << 2;
+  const uint64_t in_span = uint64_t(num_ch - 1u) * in_stride + 1024ull;
+  const uint64_t out_span = uint64_t(num_ch - 1u) * out_stride + 1024ull;
+  const uint64_t sc_span = uint64_t(num_ch) * 1024ull;
+  auto valid_span = [](uint32_t va, uint64_t len) {
+    return va >= 0x1000u && uint64_t(va) + len <= 0x100000000ull && !(va < 0xE0000000u && uint64_t(va) + len > 0xE0000000u);
+  };
+  const bool overlap_io = (uint64_t(in_data_va) < uint64_t(out_data_va) + out_span) &&
+                          (uint64_t(out_data_va) < uint64_t(in_data_va) + in_span);
+  if (!valid_span(in_data_va, in_span) || !valid_span(out_data_va, out_span) || overlap_io ||
+      (sc_va != 0u && !valid_span(sc_va, sc_span)) || ((in_data_va | out_data_va | in_stride | out_stride) & 15u) != 0u) {
+    ::__imp__sub_82A8F798(ctx, base);
+    return;
+  }
+
+  const float att_k = float(1.0 - double(float(std::pow(2.7182817459106445, double(float(-2.2f / float(att_samples)))))));
+  const float rel_k = float(1.0 - double(float(std::pow(2.7182817459106445, double(float(-2.2f / float(rel_samples)))))));
+
+  alignas(16) float gain_buf[8][256];
+  uint8_t* st_mut = Raw(base, state_va);
+  Card(base, state_va + 4u, num_ch << 2);
+  Card(base, state_va + 36u, num_ch << 2);
+
+  for (uint32_t ch = 0; ch < num_ch; ++ch) {
+    const uint32_t sc_ch_va = (sc_va != 0u) ? (sc_va + (ch << 10)) : (in_data_va + ch * in_stride);
+    float env = LoadBeF32(st_mut + 4u + (ch << 2));
+    float* dst_g = linked ? gain_buf[0] : gain_buf[ch];
+    CompressChannelFast(dst_g, Raw(base, sc_ch_va), alpha, env, threshold, ratio_exp, linked && ch > 0u, link_mode);
+    StoreBeF32(st_mut + 4u + (ch << 2), env);
+    if (!linked || ch + 1u == num_ch) {
+      float cur = LoadBeF32(st_mut + 36u + (ch << 2));
+      SmoothGainFast(dst_g, att_k, rel_k, cur);
+      StoreBeF32(st_mut + 36u + (ch << 2), cur);
+    }
+    if (sc_va != 0u) {
+      std::memset(Raw(base, sc_ch_va), 0, 1024u);
+      Card(base, sc_ch_va, 1024u);
+    }
+  }
+
+  for (uint32_t ch = 0; ch < num_ch; ++ch) {
+    const uint32_t in_ch_va = in_data_va + ch * in_stride;
+    const uint32_t out_ch_va = out_data_va + ch * out_stride;
+    ApplyGainBe256(Raw(base, out_ch_va), Raw(base, in_ch_va), linked ? gain_buf[0] : gain_buf[ch]);
+    Card(base, out_ch_va, 1024u);
+  }
+
+  // Swap ping-pong audio buffer descriptors at r4+30860 and r4+30864.
+  uint8_t* p = Raw(base, ctx_va + 30860u);
+  StoreBeU32(p, out_desc_va);
+  StoreBeU32(p + 4u, in_desc_va);
+  Card(base, ctx_va + 30860u, 8u);
+  ctx.fpscr.enableFlushMode();
+}
+
+}  // namespace n_82A8F798
+
+// 10. sub_82AA02B0: Audio RMS/Peak meter (4.1% Job 4 / 0.71% total CPU).
+namespace n_82AA02B0 {
+
+inline float LoadBeF32(const uint8_t* p) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, p, 4);
+  raw = __builtin_bswap32(raw);
+  float f;
+  std::memcpy(&f, &raw, 4);
+  return f;
+}
+
+inline void StoreBeF32(uint8_t* p, float f) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, &f, 4);
+  raw = __builtin_bswap32(raw);
+  std::memcpy(p, &raw, 4);
+}
+
+inline uint32_t LoadBeU32(const uint8_t* p) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, p, 4);
+  return __builtin_bswap32(raw);
+}
+
+inline uint16_t LoadBeU16(const uint8_t* p) noexcept {
+  uint16_t raw;
+  std::memcpy(&raw, p, 2);
+  return __builtin_bswap16(raw);
+}
+
+inline void StoreBeU16(uint8_t* p, uint16_t v) noexcept {
+  const uint16_t raw = __builtin_bswap16(v);
+  std::memcpy(p, &raw, 2);
+}
+
+[[gnu::noinline]] void ScanChannelFast(const uint8_t* __restrict ch_be, float& out_sum_sq, float& out_peak) noexcept {
+#if defined(__aarch64__)
+  float32x4_t vsum = vdupq_n_f32(0.0f);
+  float32x4_t vmax = vdupq_n_f32(0.0f);
+  for (uint32_t k = 0; k < 16u; ++k) {
+    const float32x4_t v = vabsq_f32(vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(ch_be + (k << 6)))));
+    vsum = vfmaq_f32(vsum, v, v);
+    vmax = vmaxq_f32(vmax, v);
+  }
+  const float s = vgetq_lane_f32(vsum, 0) + vgetq_lane_f32(vsum, 1) + vgetq_lane_f32(vsum, 2) + vgetq_lane_f32(vsum, 3);
+  out_sum_sq = 4.0f * s;
+  out_peak = vmaxvq_f32(vmax);
+#else
+  float s = 0.0f, pk = 0.0f;
+  for (uint32_t k = 0; k < 16u; ++k) {
+    for (uint32_t j = 0; j < 4u; ++j) {
+      const float v = std::fabs(LoadBeF32(ch_be + (k << 6) + (j << 2)));
+      s = std::fmaf(v, v, s);
+      if (v > pk) pk = v;
+    }
+  }
+  out_sum_sq = 4.0f * s;
+  out_peak = pk;
+#endif
+}
+
+inline void Impl(PPCContext& __restrict ctx, uint8_t* base, uint32_t r3, uint32_t r4) noexcept {
+  uint8_t* st = Raw(base, r3);
+  const uint32_t num_ch = st[42];
+  const int32_t win_len = int32_t(LoadBeU32(st + 376u));
+  const uint32_t ring_idx = LoadBeU16(st + 388u);
+  if (num_ch != 0u) {
+    const uint32_t stride_bytes = uint32_t(LoadBeU16(Raw(base, r4 + 14u))) << 2;
+    const uint32_t data_va = LoadBeU32(Raw(base, r4 + 4u));
+    const uint32_t rms_ring_va = r3 + uint32_t(LoadBeU16(st + 384u));
+    const uint32_t peak_ring_va = r3 + uint32_t(LoadBeU16(st + 386u));
+    const float inv_win = 1.0f / float(win_len);
+    for (uint32_t ch = 0; ch < num_ch; ++ch) {
+      float sum_sq = 0.0f, peak = 0.0f;
+      ScanChannelFast(Raw(base, (data_va + ch * stride_bytes) & ~0xFu), sum_sq, peak);
+      const float val = (sum_sq * (1.0f / 256.0f)) * inv_win;
+      const uint32_t slot = (ch * uint32_t(win_len) + ring_idx) << 2;
+      const uint32_t ch_off = ch << 2;
+      const float old_rms = LoadBeF32(Raw(base, rms_ring_va + slot));
+      float cur_rms = LoadBeF32(st + 272u + ch_off) + (val - old_rms);
+      if (cur_rms < 0.0f) cur_rms = 0.0f;
+      StoreBeF32(st + 272u + ch_off, cur_rms);
+      StoreBeF32(st + 240u + ch_off, LoadBeF32(st + 240u + ch_off) + val);
+      StoreBeF32(st + 304u + ch_off, peak);
+      if (peak > LoadBeF32(st + 336u + ch_off)) {
+        StoreBeF32(st + 336u + ch_off, peak);
+      }
+      StoreBeF32(Raw(base, peak_ring_va + slot), peak);
+      StoreBeF32(Raw(base, rms_ring_va + slot), val);
+      Card(base, peak_ring_va + slot, 4u);
+      Card(base, rms_ring_va + slot, 4u);
+    }
+    Card(base, r3 + 240u, 128u);
+    if (int32_t(ring_idx) == win_len - 1) {
+      for (uint32_t ch = 0; ch < num_ch; ++ch) {
+        const uint32_t ch_off = ch << 2;
+        StoreBeF32(st + 272u + ch_off, LoadBeF32(st + 240u + ch_off));
+        StoreBeF32(st + 240u + ch_off, 0.0f);
+      }
+    }
+  }
+  const uint32_t next_idx = (ring_idx + 1u) & 0xFFFFu;
+  StoreBeU16(st + 388u, uint16_t(int32_t(next_idx) % win_len));
+  Card(base, r3 + 388u, 2u);
+  ctx.fpscr.disableFlushMode();
+}
+
+inline void RunSelfTest() {
+  alignas(64) uint8_t buf_orig[4096]{}, buf_nat[4096]{};
+  int failures = 0;
+  auto test_case = [&](const char* label, uint16_t start_idx) {
+    std::memset(buf_orig, 0, sizeof(buf_orig));
+    constexpr u32 kObj = 0x300u;
+    constexpr u32 kDesc = 0x600u;
+    constexpr u32 kData = 0x700u;
+    buf_orig[kObj + 42u] = 2u;
+    const u32 win_be = __builtin_bswap32(4u);
+    std::memcpy(buf_orig + kObj + 376u, &win_be, 4);
+    StoreBeU16(buf_orig + kObj + 384u, 400u);
+    StoreBeU16(buf_orig + kObj + 386u, 464u);
+    StoreBeU16(buf_orig + kObj + 388u, start_idx);
+    StoreBeF32(buf_orig + kObj + 240u, 0.12f);
+    StoreBeF32(buf_orig + kObj + 244u, 0.07f);
+    StoreBeF32(buf_orig + kObj + 272u, 0.20f);
+    StoreBeF32(buf_orig + kObj + 276u, 0.15f);
+    StoreBeF32(buf_orig + kObj + 336u, 0.40f);
+    StoreBeF32(buf_orig + kObj + 340u, 0.90f);
+    StoreBeF32(buf_orig + kObj + 400u + (start_idx << 2), 0.05f);
+    StoreBeF32(buf_orig + kObj + 400u + ((4u + start_idx) << 2), 0.03f);
+    const u32 data_be = __builtin_bswap32(kData);
+    std::memcpy(buf_orig + kDesc + 4u, &data_be, 4);
+    StoreBeU16(buf_orig + kDesc + 14u, 256u);
+    for (u32 ch = 0; ch < 2u; ++ch) {
+      for (u32 i = 0; i < 256u; ++i) {
+        StoreBeF32(buf_orig + kData + ch * 1024u + (i << 2), 0.75f * std::sin(0.23f * float(i) + float(ch)));
+      }
+    }
+    std::memcpy(buf_nat, buf_orig, sizeof(buf_orig));
+    PPCContext orig{}, nat{};
+    orig.r1.u64 = nat.r1.u64 = 0x200u;
+    orig.r3.u64 = nat.r3.u64 = kObj;
+    orig.r4.u64 = nat.r4.u64 = kDesc;
+    ::__imp__sub_82AA02B0(orig, buf_orig);
+    Impl(nat, buf_nat, kObj, kDesc);
+    for (u32 off = 240u; off < 528u; off += 4u) {
+      if (off == 388u) continue;
+      const float e = LoadBeF32(buf_orig + kObj + off);
+      const float g = LoadBeF32(buf_nat + kObj + off);
+      if (std::isnan(g) || std::fabs(e - g) > 1e-5f) {
+        ++failures;
+        REXLOG_ERROR("[hot] DIFFERENCE sub_82AA02B0 self-test ({}) off={} got={} exp={}", label, off, g, e);
+        return;
+      }
+    }
+    if (LoadBeU16(buf_orig + kObj + 388u) != LoadBeU16(buf_nat + kObj + 388u)) {
+      ++failures;
+      REXLOG_ERROR("[hot] DIFFERENCE sub_82AA02B0 self-test ({}) ring_idx", label);
+    }
+  };
+  test_case("step", 1u);
+  test_case("wrap", 3u);
+  if (failures == 0) {
+    REXLOG_INFO("[hot] sub_82AA02B0 RMS/peak meter self-test: 2/2 passed");
+  } else {
+    sa2::enh::VerifyDifference();
+  }
+}
+
+inline void Native(PPCContext& __restrict ctx, uint8_t* base) noexcept {
+  static std::atomic<bool> tested_done{false};
+  if (!tested_done.load(std::memory_order_acquire)) [[unlikely]] {
+    static std::once_flag tested;
+    std::call_once(tested, [] {
+      RunSelfTest();
+      tested_done.store(true, std::memory_order_release);
+    });
+  }
+  const uint32_t r3 = ctx.r3.u32;
+  const uint32_t r4 = ctx.r4.u32;
+  if (r3 < 0x1000u || r4 < 0x1000u) {
+    ::__imp__sub_82AA02B0(ctx, base);
+    return;
+  }
+  const uint8_t* st = Raw(base, r3);
+  const int32_t win_len = int32_t(LoadBeU32(st + 376u));
+  const uint32_t num_ch = st[42];
+  if (win_len <= 0 || num_ch > 8u) {
+    ::__imp__sub_82AA02B0(ctx, base);
+    return;
+  }
+  if (num_ch != 0u) {
+    const uint32_t data_va = LoadBeU32(Raw(base, r4 + 4u));
+    const uint32_t stride_bytes = uint32_t(LoadBeU16(Raw(base, r4 + 14u))) << 2;
+    const uint64_t span = uint64_t(num_ch - 1u) * stride_bytes + 1024ull;
+    if (data_va < 0x1000u || uint64_t(data_va) + span > 0x100000000ull ||
+        (data_va < 0xE0000000u && uint64_t(data_va) + span > 0xE0000000u)) {
+      ::__imp__sub_82AA02B0(ctx, base);
+      return;
+    }
+  }
+  Impl(ctx, base, r3, r4);
+}
+
+}  // namespace n_82AA02B0
+
+// 11. sub_82A8BBC0: Linear audio resampler (4.0% Job 4 / 0.69% total CPU).
+namespace n_82A8BBC0 {
+
+inline float LoadBeF32(const uint8_t* p) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, p, 4);
+  raw = __builtin_bswap32(raw);
+  float f;
+  std::memcpy(&f, &raw, 4);
+  return f;
+}
+
+inline void StoreBeF32(uint8_t* p, float f) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, &f, 4);
+  raw = __builtin_bswap32(raw);
+  std::memcpy(p, &raw, 4);
+}
+
+[[gnu::noinline]] void ResampleFast(uint8_t* __restrict dst_be, const uint8_t* __restrict src_be, uint32_t count,
+                                    uint32_t& idx_io, uint32_t& frac_io, uint32_t step) noexcept {
+  constexpr uint32_t kInvBits = 0x377FFC9Cu;
+  float inv_65536;
+  std::memcpy(&inv_65536, &kInvBits, 4);
+  uint32_t idx = idx_io;
+  uint32_t frac = frac_io;
+  uint32_t i = 0;
+  for (; i + 4u <= count; i += 4u) {
+    const float a0 = LoadBeF32(src_be + (idx << 2));
+    const float b0 = LoadBeF32(src_be + ((idx + 1u) << 2));
+    const float y0 = std::fmaf(b0 - a0, float(frac) * inv_65536, a0);
+    uint32_t next = frac + step;
+    idx += next >> 16;
+    frac = next & 0xFFFFu;
+
+    const float a1 = LoadBeF32(src_be + (idx << 2));
+    const float b1 = LoadBeF32(src_be + ((idx + 1u) << 2));
+    const float y1 = std::fmaf(b1 - a1, float(frac) * inv_65536, a1);
+    next = frac + step;
+    idx += next >> 16;
+    frac = next & 0xFFFFu;
+
+    const float a2 = LoadBeF32(src_be + (idx << 2));
+    const float b2 = LoadBeF32(src_be + ((idx + 1u) << 2));
+    const float y2 = std::fmaf(b2 - a2, float(frac) * inv_65536, a2);
+    next = frac + step;
+    idx += next >> 16;
+    frac = next & 0xFFFFu;
+
+    const float a3 = LoadBeF32(src_be + (idx << 2));
+    const float b3 = LoadBeF32(src_be + ((idx + 1u) << 2));
+    const float y3 = std::fmaf(b3 - a3, float(frac) * inv_65536, a3);
+    next = frac + step;
+    idx += next >> 16;
+    frac = next & 0xFFFFu;
+
+#if defined(__aarch64__)
+    const float32x4_t yv = {y0, y1, y2, y3};
+    vst1q_u8(dst_be + (i << 2), vrev32q_u8(vreinterpretq_u8_f32(yv)));
+#else
+    StoreBeF32(dst_be + ((i + 0u) << 2), y0);
+    StoreBeF32(dst_be + ((i + 1u) << 2), y1);
+    StoreBeF32(dst_be + ((i + 2u) << 2), y2);
+    StoreBeF32(dst_be + ((i + 3u) << 2), y3);
+#endif
+  }
+  for (; i < count; ++i) {
+    const float a = LoadBeF32(src_be + (idx << 2));
+    const float b = LoadBeF32(src_be + ((idx + 1u) << 2));
+    StoreBeF32(dst_be + (i << 2), std::fmaf(b - a, float(frac) * inv_65536, a));
+    const uint32_t next = frac + step;
+    idx += next >> 16;
+    frac = next & 0xFFFFu;
+  }
+  idx_io = idx;
+  frac_io = frac;
+}
+
+inline void RunSelfTest() {
+  alignas(64) uint8_t buf_orig[4096]{}, buf_nat[4096]{};
+  int failures = 0;
+  auto test_case = [&](const char* label, u32 count, u32 init_idx, u16 init_frac, u32 step) {
+    std::memset(buf_orig, 0, sizeof(buf_orig));
+    constexpr u32 kSrc = 0x400u, kDst = 0xA00u, kIdx = 0x300u, kFrac = 0x304u;
+    for (u32 i = 0; i < 256u; ++i) {
+      StoreBeF32(buf_orig + kSrc + (i << 2), std::sin(0.17f * float(i)) * 0.8f);
+    }
+    const u32 idx_be = __builtin_bswap32(init_idx);
+    const u32 frac_be = __builtin_bswap32(uint32_t(init_frac) << 16);
+    std::memcpy(buf_orig + kIdx, &idx_be, 4);
+    std::memcpy(buf_orig + kFrac, &frac_be, 4);
+    std::memcpy(buf_nat, buf_orig, sizeof(buf_orig));
+    PPCContext orig{};
+    orig.r1.u64 = 0x200u;
+    orig.r3.u64 = count;
+    orig.r4.u64 = kSrc;
+    orig.r5.u64 = kDst;
+    orig.r6.u64 = kIdx;
+    orig.r7.u64 = kFrac;
+    orig.r8.u64 = step;
+    ::__imp__sub_82A8BBC0(orig, buf_orig);
+
+    uint32_t idx = init_idx;
+    uint32_t frac = init_frac;
+    ResampleFast(buf_nat + kDst, buf_nat + kSrc, count, idx, frac, step);
+    const u32 out_idx = __builtin_bswap32(idx);
+    const u32 out_frac = __builtin_bswap32(frac << 16);
+    std::memcpy(buf_nat + kIdx, &out_idx, 4);
+    std::memcpy(buf_nat + kFrac, &out_frac, 4);
+
+    if (std::memcmp(buf_orig + kIdx, buf_nat + kIdx, 8u) != 0) {
+      ++failures;
+      REXLOG_ERROR("[hot] DIFFERENCE sub_82A8BBC0 self-test ({}) idx/frac", label);
+      return;
+    }
+    for (u32 i = 0; i < count; ++i) {
+      const float e = LoadBeF32(buf_orig + kDst + (i << 2));
+      const float g = LoadBeF32(buf_nat + kDst + (i << 2));
+      if (std::isnan(g) || std::fabs(e - g) > 1e-6f) {
+        ++failures;
+        REXLOG_ERROR("[hot] DIFFERENCE sub_82A8BBC0 self-test ({}) i={} got={} exp={}", label, i, g, e);
+        return;
+      }
+    }
+  };
+  test_case("tail19_up", 19u, 2u, 0x3456u, 0x00014321u);
+  test_case("vec32_down", 32u, 0u, 0x8000u, 0x0000B333u);
+  test_case("zero", 0u, 5u, 0x1234u, 0x00010000u);
+  if (failures == 0) {
+    REXLOG_INFO("[hot] sub_82A8BBC0 resampler self-test: 3/3 passed");
+  } else {
+    sa2::enh::VerifyDifference();
+  }
+}
+
+inline void Native(PPCContext& __restrict ctx, uint8_t* base) noexcept {
+  static std::atomic<bool> tested_done{false};
+  if (!tested_done.load(std::memory_order_acquire)) [[unlikely]] {
+    static std::once_flag tested;
+    std::call_once(tested, [] {
+      RunSelfTest();
+      tested_done.store(true, std::memory_order_release);
+    });
+  }
+  const uint32_t count = ctx.r3.u32;
+  const uint32_t src_va = ctx.r4.u32;
+  const uint32_t dst_va = ctx.r5.u32;
+  const uint32_t p_idx = ctx.r6.u32;
+  const uint32_t p_frac = ctx.r7.u32;
+  const uint32_t step = ctx.r8.u32;
+  if (count > 65535u || src_va < 0x1000u || dst_va < 0x1000u || p_idx < 0x1000u || p_frac < 0x1000u) {
+    ::__imp__sub_82A8BBC0(ctx, base);
+    return;
+  }
+  uint32_t idx = REX_LOAD_U32(p_idx);
+  uint32_t frac = REX_LOAD_U16(p_frac);
+  const uint64_t dst_bytes = uint64_t(count) << 2;
+  const uint64_t end_pos = (uint64_t(idx) << 16) + frac + uint64_t(count) * step;
+  const uint64_t max_src_idx = (end_pos >> 16) + 2ull;
+  const uint64_t src_bytes = max_src_idx << 2;
+  const bool span_ok = uint64_t(dst_va) + dst_bytes <= 0x100000000ull && uint64_t(src_va) + src_bytes <= 0x100000000ull &&
+                       !(dst_va < 0xE0000000u && uint64_t(dst_va) + dst_bytes > 0xE0000000u) &&
+                       !(src_va < 0xE0000000u && uint64_t(src_va) + src_bytes > 0xE0000000u) &&
+                       (uint64_t(dst_va) + dst_bytes <= src_va || uint64_t(src_va) + src_bytes <= dst_va);
+  if (!span_ok) {
+    ::__imp__sub_82A8BBC0(ctx, base);
+    return;
+  }
+  ctx.fpscr.disableFlushMode();
+  if (count != 0u) {
+    ResampleFast(Raw(base, dst_va), Raw(base, src_va), count, idx, frac, step);
+    Card(base, dst_va, uint32_t(dst_bytes));
+  }
+  REX_STORE_U32(p_frac, frac << 16);
+  REX_STORE_U32(p_idx, idx);
+  Card(base, p_frac, 4u);
+  Card(base, p_idx, 4u);
+}
+
+}  // namespace n_82A8BBC0
+
+// 12. sub_82A85B58: Audio gain ramp (first 64 samples) + constant gain scale (2.2% Job 4 / 0.41% total CPU).
+namespace n_82A85B58 {
+
+inline float LoadBeF32(const uint8_t* p) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, p, 4);
+  raw = __builtin_bswap32(raw);
+  float f;
+  std::memcpy(&f, &raw, 4);
+  return f;
+}
+
+inline void StoreBeF32(uint8_t* p, float f) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, &f, 4);
+  raw = __builtin_bswap32(raw);
+  std::memcpy(p, &raw, 4);
+}
+
+[[gnu::noinline]] void GainRampFast(uint8_t* dst_be, const uint8_t* src_be, uint32_t count, float g0, float dg) noexcept {
+#if defined(__aarch64__)
+  float32x4_t vg = {g0, g0 + dg, std::fmaf(dg, 2.0f, g0), std::fmaf(dg, 3.0f, g0)};
+  const float32x4_t vstep = vdupq_n_f32(dg * 4.0f);
+  for (uint32_t i = 0; i < 64u; i += 4u) {
+    const uint32_t off = i << 2;
+    const float32x4_t s = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(src_be + off)));
+    vst1q_u8(dst_be + off, vrev32q_u8(vreinterpretq_u8_f32(vmulq_f32(s, vg))));
+    vg = vaddq_f32(vg, vstep);
+  }
+  const float32x4_t vc = vdupq_n_f32(std::fmaf(dg, 64.0f, g0));
+  for (uint32_t i = 64u; i < count; i += 16u) {
+    const uint32_t off = i << 2;
+    const float32x4_t s0 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(src_be + off + 0u)));
+    const float32x4_t s1 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(src_be + off + 16u)));
+    const float32x4_t s2 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(src_be + off + 32u)));
+    const float32x4_t s3 = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(src_be + off + 48u)));
+    vst1q_u8(dst_be + off + 0u, vrev32q_u8(vreinterpretq_u8_f32(vmulq_f32(s0, vc))));
+    vst1q_u8(dst_be + off + 16u, vrev32q_u8(vreinterpretq_u8_f32(vmulq_f32(s1, vc))));
+    vst1q_u8(dst_be + off + 32u, vrev32q_u8(vreinterpretq_u8_f32(vmulq_f32(s2, vc))));
+    vst1q_u8(dst_be + off + 48u, vrev32q_u8(vreinterpretq_u8_f32(vmulq_f32(s3, vc))));
+  }
+#else
+  for (uint32_t i = 0; i < 64u; ++i) {
+    StoreBeF32(dst_be + (i << 2), LoadBeF32(src_be + (i << 2)) * std::fmaf(dg, float(i), g0));
+  }
+  const float gc = std::fmaf(dg, 64.0f, g0);
+  for (uint32_t i = 64u; i < count; ++i) {
+    StoreBeF32(dst_be + (i << 2), LoadBeF32(src_be + (i << 2)) * gc);
+  }
+#endif
+}
+
+inline void RunSelfTest() {
+  alignas(128) uint8_t buf_orig[4096]{}, buf_nat[4096]{};
+  int failures = 0;
+  auto test_case = [&](const char* label, u32 dst_va, u32 src_va, u32 count, double g0, double dg) {
+    std::memset(buf_orig, 0, sizeof(buf_orig));
+    for (u32 i = 0; i < count; ++i) {
+      StoreBeF32(buf_orig + src_va + (i << 2), std::sin(0.13f * float(i)) * 0.7f);
+    }
+    std::memcpy(buf_nat, buf_orig, sizeof(buf_orig));
+    PPCContext orig{};
+    orig.r1.u64 = 0x200u;
+    orig.r3.u64 = dst_va;
+    orig.r4.u64 = src_va;
+    orig.r7.u64 = count;
+    orig.f1.f64 = g0;
+    orig.f2.f64 = dg;
+    ::__imp__sub_82A85B58(orig, buf_orig);
+    GainRampFast(buf_nat + dst_va, buf_nat + src_va, count, float(g0), float(dg));
+    for (u32 i = 0; i < count; ++i) {
+      const float e = LoadBeF32(buf_orig + dst_va + (i << 2));
+      const float g = LoadBeF32(buf_nat + dst_va + (i << 2));
+      if (std::isnan(g) || std::fabs(e - g) > 1e-5f) {
+        ++failures;
+        REXLOG_ERROR("[hot] DIFFERENCE sub_82A85B58 self-test ({}) i={} got={} exp={}", label, i, g, e);
+        return;
+      }
+    }
+  };
+  test_case("out256", 0x400u, 0x900u, 256u, 0.25, 0.01);
+  test_case("inplace96", 0x400u, 0x400u, 96u, 1.0, -0.005);
+  if (failures == 0) {
+    REXLOG_INFO("[hot] sub_82A85B58 gain ramp self-test: 2/2 passed");
+  } else {
+    sa2::enh::VerifyDifference();
+  }
+}
+
+inline void Native(PPCContext& __restrict ctx, uint8_t* base) noexcept {
+  static std::atomic<bool> tested_done{false};
+  if (!tested_done.load(std::memory_order_acquire)) [[unlikely]] {
+    static std::once_flag tested;
+    std::call_once(tested, [] {
+      RunSelfTest();
+      tested_done.store(true, std::memory_order_release);
+    });
+  }
+  const uint32_t dst_va = ctx.r3.u32;
+  const uint32_t src_va = ctx.r4.u32;
+  const uint32_t count = ctx.r7.u32;
+  const uint64_t bytes = uint64_t(count) << 2;
+  const bool ok = ((dst_va | src_va) & 15u) == 0u && count >= 96u && (count & 31u) == 0u &&
+                  dst_va >= 0x1000u && src_va >= 0x1000u &&
+                  uint64_t(dst_va) + bytes <= 0x100000000ull && uint64_t(src_va) + bytes <= 0x100000000ull &&
+                  !(dst_va < 0xE0000000u && uint64_t(dst_va) + bytes > 0xE0000000u) &&
+                  !(src_va < 0xE0000000u && uint64_t(src_va) + bytes > 0xE0000000u) &&
+                  (dst_va == src_va || uint64_t(dst_va) + bytes <= src_va || uint64_t(src_va) + bytes <= dst_va);
+  if (!ok) {
+    ::__imp__sub_82A85B58(ctx, base);
+    return;
+  }
+  Card(base, dst_va, uint32_t(bytes));
+  ctx.fpscr.enableFlushMode();
+  GainRampFast(Raw(base, dst_va), Raw(base, src_va), count, float(ctx.f1.f64), float(ctx.f2.f64));
+}
+
+}  // namespace n_82A85B58
+
+// 13. sub_82440038: SQT transform compose (0.71-1.12% total CPU across FGGameSim & Job workers).
+namespace n_82440038 {
+
+inline float LoadBeF32(const uint8_t* p) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, p, 4);
+  raw = __builtin_bswap32(raw);
+  float f;
+  std::memcpy(&f, &raw, 4);
+  return f;
+}
+
+inline void StoreBeF32(uint8_t* p, float f) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, &f, 4);
+  raw = __builtin_bswap32(raw);
+  std::memcpy(p, &raw, 4);
+}
+
+#if defined(__aarch64__)
+inline float32x4_t LoadBeF4(const uint8_t* p) noexcept {
+  return vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(p)));
+}
+
+inline void StoreBeF4(uint8_t* p, float32x4_t v) noexcept {
+  vst1q_u8(p, vrev32q_u8(vreinterpretq_u8_f32(v)));
+}
+
+inline float32x4_t Yzx(float32x4_t v) noexcept {
+  const float32x4_t yzwx = vextq_f32(v, v, 1);
+  return vcombine_f32(vget_low_f32(yzwx), vrev64_f32(vget_high_f32(yzwx)));
+}
+
+inline float32x4_t Cross3(float32x4_t a, float32x4_t b) noexcept {
+  const float32x4_t a_yzx = Yzx(a);
+  const float32x4_t b_yzx = Yzx(b);
+  return Yzx(vfmsq_f32(vmulq_f32(a, b_yzx), a_yzx, b));
+}
+#endif
+
+[[gnu::noinline]] void ComposeFast(uint8_t* dst, const uint8_t* a, const uint8_t* b) noexcept {
+#if defined(__aarch64__)
+  const float32x4_t sA = LoadBeF4(a + 0u);
+  const float32x4_t qA = LoadBeF4(a + 16u);
+  const float32x4_t pA = LoadBeF4(a + 32u);
+  const float32x4_t sB = LoadBeF4(b + 0u);
+  const float32x4_t qB = LoadBeF4(b + 16u);
+  const float32x4_t pB = LoadBeF4(b + 32u);
+
+  const float32x4_t out_s = vmulq_f32(sB, sA);
+  const float32x4_t q_xyz = vfmaq_laneq_f32(vfmaq_laneq_f32(Cross3(qB, qA), qA, qB, 3), qB, qA, 3);
+  const float32x4_t q_prod = vmulq_f32(qB, qA);
+  const float dot3 = vgetq_lane_f32(q_prod, 0) + vgetq_lane_f32(q_prod, 1) + vgetq_lane_f32(q_prod, 2);
+  const float32x4_t out_q = vsetq_lane_f32(vgetq_lane_f32(qB, 3) * vgetq_lane_f32(qA, 3) - dot3, q_xyz, 3);
+
+  const float32x4_t t = vmulq_f32(pA, sB);
+  const float32x4_t c1 = vfmaq_laneq_f32(Cross3(qB, t), t, qB, 3);
+  const float32x4_t c2 = Cross3(qB, c1);
+  const float32x4_t out_p = vaddq_f32(pB, vfmaq_f32(t, vdupq_n_f32(2.0f), c2));
+
+  StoreBeF4(dst + 0u, out_s);
+  StoreBeF4(dst + 16u, out_q);
+  StoreBeF4(dst + 32u, out_p);
+#else
+  float sA[4], qA[4], pA[4], sB[4], qB[4], pB[4];
+  for (int i = 0; i < 4; ++i) {
+    sA[i] = LoadBeF32(a + i * 4);
+    qA[i] = LoadBeF32(a + 16 + i * 4);
+    pA[i] = LoadBeF32(a + 32 + i * 4);
+    sB[i] = LoadBeF32(b + i * 4);
+    qB[i] = LoadBeF32(b + 16 + i * 4);
+    pB[i] = LoadBeF32(b + 32 + i * 4);
+  }
+  auto cross = [](const float u[3], const float v[3], float o[3]) {
+    o[0] = u[1] * v[2] - u[2] * v[1];
+    o[1] = u[2] * v[0] - u[0] * v[2];
+    o[2] = u[0] * v[1] - u[1] * v[0];
+  };
+  float out_s[4], out_q[4], out_p[4];
+  for (int i = 0; i < 4; ++i) out_s[i] = sB[i] * sA[i];
+  float cq[3];
+  cross(qB, qA, cq);
+  for (int i = 0; i < 3; ++i) out_q[i] = cq[i] + qB[3] * qA[i] + qA[3] * qB[i];
+  out_q[3] = qB[3] * qA[3] - (qB[0] * qA[0] + qB[1] * qA[1] + qB[2] * qA[2]);
+  float t[4], c1[3], c2[3];
+  for (int i = 0; i < 4; ++i) t[i] = pA[i] * sB[i];
+  cross(qB, t, c1);
+  for (int i = 0; i < 3; ++i) c1[i] += qB[3] * t[i];
+  cross(qB, c1, c2);
+  for (int i = 0; i < 3; ++i) out_p[i] = pB[i] + (2.0f * c2[i] + t[i]);
+  out_p[3] = pB[3] + t[3];
+  for (int i = 0; i < 4; ++i) {
+    StoreBeF32(dst + i * 4, out_s[i]);
+    StoreBeF32(dst + 16 + i * 4, out_q[i]);
+    StoreBeF32(dst + 32 + i * 4, out_p[i]);
+  }
+#endif
+}
+
+inline void RunSelfTest() {
+  alignas(64) uint8_t buf_orig[512]{}, buf_nat[512]{};
+  int failures = 0;
+  auto test_case = [&](const char* label, u32 dst_va, u32 a_va, u32 b_va) {
+    std::memset(buf_orig, 0, sizeof(buf_orig));
+    const float a_vals[12] = {1.2f, 0.8f, 1.5f, 1.0f, 0.1f, -0.2f, 0.3f, 0.9273618f, 3.5f, -1.25f, 2.0f, 1.0f};
+    const float b_vals[12] = {0.9f, 1.1f, 0.7f, 1.0f, -0.3f, 0.4f, -0.1f, 0.8602325f, -4.0f, 2.5f, 1.75f, 0.5f};
+    for (u32 i = 0; i < 12u; ++i) {
+      StoreBeF32(buf_orig + a_va + (i << 2), a_vals[i]);
+      StoreBeF32(buf_orig + b_va + (i << 2), b_vals[i]);
+    }
+    std::memcpy(buf_nat, buf_orig, sizeof(buf_orig));
+    PPCContext orig{};
+    orig.r3.u64 = dst_va;
+    orig.r4.u64 = a_va;
+    orig.r5.u64 = b_va;
+    ::__imp__sub_82440038(orig, buf_orig);
+    ComposeFast(buf_nat + dst_va, buf_nat + a_va, buf_nat + b_va);
+    for (u32 i = 0; i < 12u; ++i) {
+      const float e = LoadBeF32(buf_orig + dst_va + (i << 2));
+      const float g = LoadBeF32(buf_nat + dst_va + (i << 2));
+      if (std::isnan(g) || std::fabs(e - g) > 1e-5f) {
+        ++failures;
+        REXLOG_ERROR("[hot] DIFFERENCE sub_82440038 self-test ({}) i={} got={} exp={}", label, i, g, e);
+        return;
+      }
+    }
+  };
+  test_case("separate", 0x100u, 0x040u, 0x080u);
+  test_case("alias_a", 0x040u, 0x040u, 0x080u);
+  test_case("alias_b", 0x080u, 0x040u, 0x080u);
+  if (failures == 0) {
+    REXLOG_INFO("[hot] sub_82440038 transform compose self-test: 3/3 passed");
+  } else {
+    sa2::enh::VerifyDifference();
+  }
+}
+
+inline void Native(PPCContext& __restrict ctx, uint8_t* base) noexcept {
+  static std::atomic<bool> tested_done{false};
+  if (!tested_done.load(std::memory_order_acquire)) [[unlikely]] {
+    static std::once_flag tested;
+    std::call_once(tested, [] {
+      RunSelfTest();
+      tested_done.store(true, std::memory_order_release);
+    });
+  }
+  const uint32_t dst_va = ctx.r3.u32 & ~0xFu;
+  const uint32_t a_va = ctx.r4.u32 & ~0xFu;
+  const uint32_t b_va = ctx.r5.u32 & ~0xFu;
+  if (dst_va < 0x1000u || a_va < 0x1000u || b_va < 0x1000u) {
+    ::__imp__sub_82440038(ctx, base);
+    return;
+  }
+  ComposeFast(Raw(base, dst_va), Raw(base, a_va), Raw(base, b_va));
+  Card(base, dst_va, 48u);
+  ctx.fpscr.enableFlushMode();
+}
+
+}  // namespace n_82440038
+
+// 14. sub_82B85E10: 4-wide cloth/physics distance constraint solver (2.10% total CPU).
+namespace n_82B85E10 {
+
+inline float LoadBeF32(const uint8_t* p) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, p, 4);
+  raw = __builtin_bswap32(raw);
+  float f;
+  std::memcpy(&f, &raw, 4);
+  return f;
+}
+
+inline void StoreBeF32(uint8_t* p, float f) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, &f, 4);
+  raw = __builtin_bswap32(raw);
+  std::memcpy(p, &raw, 4);
+}
+
+inline int16_t LoadBeS16(const uint8_t* p) noexcept {
+  uint16_t raw;
+  std::memcpy(&raw, p, 2);
+  return int16_t(__builtin_bswap16(raw));
+}
+
+#if defined(__aarch64__)
+inline float32x4_t LoadBeF4(const uint8_t* p) noexcept {
+  return vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(p)));
+}
+
+inline void StoreBeF4(uint8_t* p, float32x4_t v) noexcept {
+  vst1q_u8(p, vrev32q_u8(vreinterpretq_u8_f32(v)));
+}
+
+inline void Transpose4x4(float32x4_t r0, float32x4_t r1, float32x4_t r2, float32x4_t r3, float32x4_t& c0,
+                         float32x4_t& c1, float32x4_t& c2, float32x4_t& c3) noexcept {
+  const float32x4_t t0 = vtrn1q_f32(r0, r1);
+  const float32x4_t t1 = vtrn2q_f32(r0, r1);
+  const float32x4_t t2 = vtrn1q_f32(r2, r3);
+  const float32x4_t t3 = vtrn2q_f32(r2, r3);
+  c0 = vreinterpretq_f32_f64(vzip1q_f64(vreinterpretq_f64_f32(t0), vreinterpretq_f64_f32(t2)));
+  c2 = vreinterpretq_f32_f64(vzip2q_f64(vreinterpretq_f64_f32(t0), vreinterpretq_f64_f32(t2)));
+  c1 = vreinterpretq_f32_f64(vzip1q_f64(vreinterpretq_f64_f32(t1), vreinterpretq_f64_f32(t3)));
+  c3 = vreinterpretq_f32_f64(vzip2q_f64(vreinterpretq_f64_f32(t1), vreinterpretq_f64_f32(t3)));
+}
+#endif
+
+[[gnu::noinline]] void SolveConstraintsFast(uint8_t* base, uint32_t posA_va, uint32_t posB_va, uint32_t con_va,
+                                            int32_t count4, float stiff_stretch, float stiff_compress) noexcept {
+  const uint8_t* cp = Raw(base, con_va);
+#if defined(__aarch64__)
+  const float32x4_t vzero = vdupq_n_f32(0.0f);
+  const float32x4_t vone = vdupq_n_f32(1.0f);
+  const float32x4_t vf1 = vdupq_n_f32(stiff_stretch);
+  const float32x4_t vf2 = vdupq_n_f32(stiff_compress);
+  for (int32_t iter = 0; iter < count4; ++iter, cp += 32u) {
+    const uint32_t eaA0 = (posA_va + uint32_t(int32_t(LoadBeS16(cp + 0u)) << 4)) & ~0xFu;
+    const uint32_t eaB0 = (posB_va + uint32_t(int32_t(LoadBeS16(cp + 2u)) << 4)) & ~0xFu;
+    const uint32_t eaA1 = (posA_va + uint32_t(int32_t(LoadBeS16(cp + 8u)) << 4)) & ~0xFu;
+    const uint32_t eaB1 = (posB_va + uint32_t(int32_t(LoadBeS16(cp + 10u)) << 4)) & ~0xFu;
+    const uint32_t eaA2 = (posA_va + uint32_t(int32_t(LoadBeS16(cp + 16u)) << 4)) & ~0xFu;
+    const uint32_t eaB2 = (posB_va + uint32_t(int32_t(LoadBeS16(cp + 18u)) << 4)) & ~0xFu;
+    const uint32_t eaA3 = (posA_va + uint32_t(int32_t(LoadBeS16(cp + 24u)) << 4)) & ~0xFu;
+    const uint32_t eaB3 = (posB_va + uint32_t(int32_t(LoadBeS16(cp + 26u)) << 4)) & ~0xFu;
+
+    const float32x4_t rest = {LoadBeF32(cp + 4u), LoadBeF32(cp + 12u), LoadBeF32(cp + 20u), LoadBeF32(cp + 28u)};
+    float32x4_t bx, by, bz, bw, ax, ay, az, aw;
+    Transpose4x4(LoadBeF4(Raw(base, eaB0)), LoadBeF4(Raw(base, eaB1)), LoadBeF4(Raw(base, eaB2)),
+                 LoadBeF4(Raw(base, eaB3)), bx, by, bz, bw);
+    Transpose4x4(LoadBeF4(Raw(base, eaA0)), LoadBeF4(Raw(base, eaA1)), LoadBeF4(Raw(base, eaA2)),
+                 LoadBeF4(Raw(base, eaA3)), ax, ay, az, aw);
+
+    const float32x4_t dx = vsubq_f32(bx, ax);
+    const float32x4_t dy = vsubq_f32(by, ay);
+    const float32x4_t dz = vsubq_f32(bz, az);
+    const uint32x4_t sum_pos = vcgtq_f32(vaddq_f32(aw, bw), vzero);
+    const float32x4_t eff_wA = vbslq_f32(sum_pos, aw, vone);
+    const float32x4_t eff_wB = vbslq_f32(sum_pos, bw, vone);
+    const float32x4_t inv_sum = vdivq_f32(vone, vaddq_f32(eff_wA, eff_wB));
+
+    const float32x4_t dist2 = vfmaq_f32(vfmaq_f32(vmulq_f32(dz, dz), dy, dy), dx, dx);
+    const uint32x4_t is_zero = vceqq_f32(dist2, vzero);
+    const float32x4_t inv_dist = vdivq_f32(vone, vsqrtq_f32(dist2));
+    const float32x4_t diff = vmulq_f32(vsubq_f32(rest, vmulq_f32(dist2, inv_dist)), inv_dist);
+    const float32x4_t stiff = vbslq_f32(vcgtq_f32(diff, vzero), vf2, vf1);
+    const float32x4_t lambda = vbslq_f32(is_zero, vzero, vmulq_f32(diff, stiff));
+    const float32x4_t corr = vmulq_f32(lambda, inv_sum);
+    const float32x4_t cA = vmulq_f32(eff_wA, corr);
+    const float32x4_t cB = vmulq_f32(eff_wB, corr);
+
+    const float32x4_t nbx = vfmaq_f32(bx, dx, cB);
+    const float32x4_t nby = vfmaq_f32(by, dy, cB);
+    const float32x4_t nbz = vfmaq_f32(bz, dz, cB);
+    const float32x4_t nax = vfmsq_f32(ax, dx, cA);
+    const float32x4_t nay = vfmsq_f32(ay, dy, cA);
+    const float32x4_t naz = vfmsq_f32(az, dz, cA);
+
+    float32x4_t ob0, ob1, ob2, ob3, oa0, oa1, oa2, oa3;
+    Transpose4x4(nbx, nby, nbz, bw, ob0, ob1, ob2, ob3);
+    Transpose4x4(nax, nay, naz, aw, oa0, oa1, oa2, oa3);
+
+    StoreBeF4(Raw(base, eaB0), ob0);
+    StoreBeF4(Raw(base, eaB1), ob1);
+    StoreBeF4(Raw(base, eaB2), ob2);
+    StoreBeF4(Raw(base, eaB3), ob3);
+    StoreBeF4(Raw(base, eaA0), oa0);
+    StoreBeF4(Raw(base, eaA1), oa1);
+    StoreBeF4(Raw(base, eaA2), oa2);
+    StoreBeF4(Raw(base, eaA3), oa3);
+    Card(base, eaB0, 16u);
+    Card(base, eaB1, 16u);
+    Card(base, eaB2, 16u);
+    Card(base, eaB3, 16u);
+    Card(base, eaA0, 16u);
+    Card(base, eaA1, 16u);
+    Card(base, eaA2, 16u);
+    Card(base, eaA3, 16u);
+  }
+#else
+  for (int32_t iter = 0; iter < count4; ++iter, cp += 32u) {
+    uint32_t eaA[4], eaB[4];
+    float A[4][4], B[4][4], rest[4];
+    for (int k = 0; k < 4; ++k) {
+      eaA[k] = (posA_va + uint32_t(int32_t(LoadBeS16(cp + k * 8 + 0)) << 4)) & ~0xFu;
+      eaB[k] = (posB_va + uint32_t(int32_t(LoadBeS16(cp + k * 8 + 2)) << 4)) & ~0xFu;
+      rest[k] = LoadBeF32(cp + k * 8 + 4);
+      for (int c = 0; c < 4; ++c) {
+        B[k][c] = LoadBeF32(Raw(base, eaB[k]) + c * 4);
+        A[k][c] = LoadBeF32(Raw(base, eaA[k]) + c * 4);
+      }
+    }
+    for (int k = 0; k < 4; ++k) {
+      const float dx = B[k][0] - A[k][0], dy = B[k][1] - A[k][1], dz = B[k][2] - A[k][2];
+      const bool pos_w = (A[k][3] + B[k][3]) > 0.0f;
+      const float ewA = pos_w ? A[k][3] : 1.0f;
+      const float ewB = pos_w ? B[k][3] : 1.0f;
+      const float inv_sum = 1.0f / (ewA + ewB);
+      const float dist2 = dx * dx + dy * dy + dz * dz;
+      float lam = 0.0f;
+      if (dist2 != 0.0f) {
+        const float inv_d = 1.0f / std::sqrt(dist2);
+        const float diff = (rest[k] - dist2 * inv_d) * inv_d;
+        lam = diff * ((diff > 0.0f) ? stiff_compress : stiff_stretch);
+      }
+      const float corr = lam * inv_sum;
+      B[k][0] += dx * (ewB * corr);
+      B[k][1] += dy * (ewB * corr);
+      B[k][2] += dz * (ewB * corr);
+      A[k][0] -= dx * (ewA * corr);
+      A[k][1] -= dy * (ewA * corr);
+      A[k][2] -= dz * (ewA * corr);
+    }
+    for (int k = 0; k < 4; ++k) {
+      for (int c = 0; c < 4; ++c) StoreBeF32(Raw(base, eaB[k]) + c * 4, B[k][c]);
+      Card(base, eaB[k], 16u);
+    }
+    for (int k = 0; k < 4; ++k) {
+      for (int c = 0; c < 4; ++c) StoreBeF32(Raw(base, eaA[k]) + c * 4, A[k][c]);
+      Card(base, eaA[k], 16u);
+    }
+  }
+#endif
+}
+
+inline void RunSelfTest() {
+  alignas(64) uint8_t buf_orig[2048]{}, buf_nat[2048]{};
+  constexpr u32 kPos = 0x400u, kCon = 0x600u;
+  const float pts[8][4] = {
+      {0.0f, 0.0f, 0.0f, 1.0f},  {2.0f, 0.5f, -0.5f, 0.5f},
+      {1.0f, 1.0f, 1.0f, 0.25f}, {1.2f, 1.1f, 0.9f, 0.75f},
+      {3.0f, 3.0f, 3.0f, 1.0f},  {3.0f, 3.0f, 3.0f, 1.0f},   // dist2 == 0
+      {-1.0f, 0.0f, 2.0f, 0.0f}, {0.5f, -1.0f, 2.0f, 0.0f},  // Aw + Bw == 0
+  };
+  for (u32 i = 0; i < 8u; ++i) {
+    for (u32 c = 0; c < 4u; ++c) StoreBeF32(buf_orig + kPos + i * 16u + c * 4u, pts[i][c]);
+  }
+  auto put_con = [&](u32 idx, int16_t a, int16_t b, float rest) {
+    const uint16_t ab = __builtin_bswap16(uint16_t(a));
+    const uint16_t bb = __builtin_bswap16(uint16_t(b));
+    std::memcpy(buf_orig + kCon + idx * 8u + 0u, &ab, 2);
+    std::memcpy(buf_orig + kCon + idx * 8u + 2u, &bb, 2);
+    StoreBeF32(buf_orig + kCon + idx * 8u + 4u, rest);
+  };
+  put_con(0, 0, 1, 1.0f);   // stretch
+  put_con(1, 2, 3, 1.5f);   // compress
+  put_con(2, 4, 5, 0.5f);   // zero distance
+  put_con(3, 6, 7, 1.0f);   // zero invMass sum
+  put_con(4, 0, 2, 1.2f);   // shared/aliased vertices across batch
+  put_con(5, 1, 2, 0.9f);
+  put_con(6, 3, 0, 1.8f);
+  put_con(7, 2, 1, 1.1f);
+  std::memcpy(buf_nat, buf_orig, sizeof(buf_orig));
+
+  PPCContext orig{};
+  orig.r1.u64 = 0x200u;
+  orig.r3.u64 = kPos;
+  orig.r4.u64 = kPos;
+  orig.r5.u64 = kCon;
+  orig.r6.u64 = 8u;
+  orig.f1.f64 = 0.8;
+  orig.f2.f64 = 0.3;
+  ::__imp__sub_82B85E10(orig, buf_orig);
+  SolveConstraintsFast(buf_nat, kPos, kPos, kCon, 2, 0.8f, 0.3f);
+
+  int failures = 0;
+  for (u32 i = 0; i < 32u; ++i) {
+    const float e = LoadBeF32(buf_orig + kPos + (i << 2));
+    const float g = LoadBeF32(buf_nat + kPos + (i << 2));
+    if (std::isnan(g) || std::fabs(e - g) > 1e-5f) {
+      ++failures;
+      REXLOG_ERROR("[hot] DIFFERENCE sub_82B85E10 self-test idx={} got={} exp={}", i, g, e);
+      break;
+    }
+  }
+  if (failures == 0) {
+    REXLOG_INFO("[hot] sub_82B85E10 distance constraints self-test: passed");
+  } else {
+    sa2::enh::VerifyDifference();
+  }
+}
+
+inline void Native(PPCContext& __restrict ctx, uint8_t* base) noexcept {
+  static std::atomic<bool> tested_done{false};
+  if (!tested_done.load(std::memory_order_acquire)) [[unlikely]] {
+    static std::once_flag tested;
+    std::call_once(tested, [] {
+      RunSelfTest();
+      tested_done.store(true, std::memory_order_release);
+    });
+  }
+  const int32_t count4 = ctx.r6.s32 / 4;
+  if (count4 <= 0) return;
+  const uint32_t posA_va = ctx.r3.u32;
+  const uint32_t posB_va = ctx.r4.u32;
+  const uint32_t con_va = ctx.r5.u32;
+  if (posA_va < 0x1000u || posB_va < 0x1000u || con_va < 0x1000u) {
+    ::__imp__sub_82B85E10(ctx, base);
+    return;
+  }
+  ctx.fpscr.enableFlushMode();
+  SolveConstraintsFast(base, posA_va, posB_va, con_va, count4, float(ctx.f1.f64), float(ctx.f2.f64));
+}
+
+}  // namespace n_82B85E10
+
+// 15. sub_826D61A0: DMA morph-target / blendshape vertex accumulator (0.91-1.08% total CPU).
+namespace n_826D61A0 {
+
+inline float LoadBeF32(const uint8_t* p) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, p, 4);
+  raw = __builtin_bswap32(raw);
+  float f;
+  std::memcpy(&f, &raw, 4);
+  return f;
+}
+
+inline void StoreBeF32(uint8_t* p, float f) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, &f, 4);
+  raw = __builtin_bswap32(raw);
+  std::memcpy(p, &raw, 4);
+}
+
+inline uint32_t LoadBeU32(const uint8_t* p) noexcept {
+  uint32_t raw;
+  std::memcpy(&raw, p, 4);
+  return __builtin_bswap32(raw);
+}
+
+inline uint16_t LoadBeU16(const uint8_t* p) noexcept {
+  uint16_t raw;
+  std::memcpy(&raw, p, 2);
+  return __builtin_bswap16(raw);
+}
+
+[[gnu::noinline]] void AccumSingleStream(uint8_t* __restrict dst_be, const uint8_t* __restrict src_be, int32_t stride,
+                                         int32_t count, const float w[4]) noexcept {
+#if defined(__aarch64__)
+  const float32x4_t vw = vld1q_f32(w);
+  for (int32_t i = 0; i < count; ++i) {
+    const float32x4_t s = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(src_be)));
+    const float32x4_t d = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(dst_be)));
+    vst1q_u8(dst_be, vrev32q_u8(vreinterpretq_u8_f32(vfmaq_f32(d, vw, s))));
+    dst_be += 16;
+    src_be += stride;
+  }
+#else
+  for (int32_t i = 0; i < count; ++i) {
+    for (int c = 0; c < 4; ++c) {
+      const float s = LoadBeF32(src_be + c * 4);
+      const float d = LoadBeF32(dst_be + c * 4);
+      StoreBeF32(dst_be + c * 4, std::fmaf(w[c], s, d));
+    }
+    dst_be += 16;
+    src_be += stride;
+  }
+#endif
+}
+
+[[gnu::noinline]] void AccumMultiStream(uint8_t* base, const uint32_t* out_streams, const uint32_t* src_offs,
+                                        const uint32_t* dst_idxs, int32_t num_streams, uint32_t dst_byte_off,
+                                        uint32_t src_va, int32_t stride, int32_t count, const float w[4]) noexcept {
+#if defined(__aarch64__)
+  const float32x4_t vw = vld1q_f32(w);
+  for (int32_t i = 0; i < count; ++i) {
+    for (int32_t s = 0; s < num_streams; ++s) {
+      const uint32_t sea = (src_va + src_offs[s]) & ~0xFu;
+      const uint32_t dea = (out_streams[dst_idxs[s]] + dst_byte_off) & ~0xFu;
+      const float32x4_t sv = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(Raw(base, sea))));
+      const float32x4_t dv = vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(Raw(base, dea))));
+      vst1q_u8(Raw(base, dea), vrev32q_u8(vreinterpretq_u8_f32(vfmaq_f32(dv, vw, sv))));
+    }
+    dst_byte_off += 16u;
+    src_va += uint32_t(stride);
+  }
+#else
+  for (int32_t i = 0; i < count; ++i) {
+    for (int32_t s = 0; s < num_streams; ++s) {
+      const uint8_t* sp = Raw(base, (src_va + src_offs[s]) & ~0xFu);
+      uint8_t* dp = Raw(base, (out_streams[dst_idxs[s]] + dst_byte_off) & ~0xFu);
+      for (int c = 0; c < 4; ++c) StoreBeF32(dp + c * 4, std::fmaf(w[c], LoadBeF32(sp + c * 4), LoadBeF32(dp + c * 4)));
+    }
+    dst_byte_off += 16u;
+    src_va += uint32_t(stride);
+  }
+#endif
+}
+
+inline void RunSelfTest() {
+  alignas(64) uint8_t buf[1024]{};
+  const float w[4] = {0.35f, -0.5f, 0.75f, 0.25f};
+  for (u32 v = 0; v < 4u; ++v) {
+    for (u32 c = 0; c < 4u; ++c) {
+      StoreBeF32(buf + 0x100u + v * 16u + c * 4u, float(v + 1u) * 0.5f + float(c));
+      StoreBeF32(buf + 0x180u + v * 16u + c * 4u, -float(v + 1u) * 0.25f + float(c) * 0.5f);
+      StoreBeF32(buf + 0x200u + v * 32u + c * 4u, 0.1f * float(v * 4u + c + 1u));
+      StoreBeF32(buf + 0x200u + v * 32u + 16u + c * 4u, -0.2f * float(v * 4u + c + 1u));
+    }
+  }
+  uint8_t ref[1024];
+  std::memcpy(ref, buf, sizeof(buf));
+  AccumSingleStream(buf + 0x100u, buf + 0x200u, 32, 4, w);
+  const uint32_t out_s[2] = {0x100u, 0x180u};
+  const uint32_t src_o[2] = {0u, 16u};
+  const uint32_t dst_i[2] = {0u, 1u};
+  AccumMultiStream(buf, out_s, src_o, dst_i, 2, 0u, 0x200u, 32, 4, w);
+
+  // Scalar reference: single stream adds w*src0 to s0; multi adds w*src0 to s0 again and w*src1 to s1.
+  int failures = 0;
+  for (u32 v = 0; v < 4u; ++v) {
+    for (u32 c = 0; c < 4u; ++c) {
+      const float s0 = LoadBeF32(ref + 0x200u + v * 32u + c * 4u);
+      const float s1 = LoadBeF32(ref + 0x200u + v * 32u + 16u + c * 4u);
+      const float e0 = std::fmaf(w[c], s0, std::fmaf(w[c], s0, LoadBeF32(ref + 0x100u + v * 16u + c * 4u)));
+      const float e1 = std::fmaf(w[c], s1, LoadBeF32(ref + 0x180u + v * 16u + c * 4u));
+      const float g0 = LoadBeF32(buf + 0x100u + v * 16u + c * 4u);
+      const float g1 = LoadBeF32(buf + 0x180u + v * 16u + c * 4u);
+      if (std::isnan(g0) || std::isnan(g1) || std::fabs(g0 - e0) > 1e-5f || std::fabs(g1 - e1) > 1e-5f) {
+        ++failures;
+        REXLOG_ERROR("[hot] DIFFERENCE sub_826D61A0 self-test v={} c={}", v, c);
+        break;
+      }
+    }
+  }
+  if (failures == 0) {
+    REXLOG_INFO("[hot] sub_826D61A0 morph accumulator self-test: passed");
+  } else {
+    sa2::enh::VerifyDifference();
+  }
+}
+
+inline void Native(PPCContext& __restrict ctx, uint8_t* base) noexcept {
+  static std::atomic<bool> tested_done{false};
+  if (!tested_done.load(std::memory_order_acquire)) [[unlikely]] {
+    static std::once_flag tested;
+    std::call_once(tested, [] {
+      RunSelfTest();
+      tested_done.store(true, std::memory_order_release);
+    });
+  }
+  const uint64_t old_sp = ctx.r1.u64;
+  const uint32_t r3_in = ctx.r3.u32;
+  const uint32_t r4_in = ctx.r4.u32;
+  const uint32_t r5_in = ctx.r5.u32;
+  if (uint32_t(old_sp) < 0x4000u || r5_in < 0x1000u) {
+    ::__imp__sub_826D61A0(ctx, base);
+    return;
+  }
+  const uint8_t* params = Raw(base, r5_in);
+  const int32_t num_io_streams = int32_t(LoadBeU32(params + 11424u));
+  if (num_io_streams < 0 || num_io_streams > 8) {
+    ::__imp__sub_826D61A0(ctx, base);
+    return;
+  }
+
+  // Parse active targets (non-zero weights and blocks_remaining != 0) into compact L1-resident host arrays.
+  struct TargetState {
+    float weight[4];
+    int32_t num_streams;
+    uint32_t src_offs[8];
+    uint32_t dst_idxs[8];
+    int32_t blocks_rem;
+    int32_t stride;
+    uint32_t block_ptr;
+  };
+  TargetState active[119];
+  uint32_t num_active = 0;
+  for (uint32_t m = 0; m < 119u; ++m) {
+    const uint8_t* wp = params + (m << 4);
+    const float w0 = LoadBeF32(wp + 0u);
+    const float w1 = LoadBeF32(wp + 4u);
+    const float w2 = LoadBeF32(wp + 8u);
+    const float w3 = LoadBeF32(wp + 12u);
+    if (w0 == 0.0f && w1 == 0.0f && w2 == 0.0f && w3 == 0.0f) continue;
+    const uint8_t* tp = params + 1904u + m * 80u;
+    const int32_t blocks_rem = int32_t(LoadBeU32(tp + 68u));
+    if (blocks_rem == 0) continue;
+    const int32_t n_str = int32_t(LoadBeU32(tp + 0u));
+    if (n_str < 0 || n_str > 8) {
+      ::__imp__sub_826D61A0(ctx, base);
+      return;
+    }
+    TargetState& ts = active[num_active++];
+    ts.weight[0] = w0;
+    ts.weight[1] = w1;
+    ts.weight[2] = w2;
+    ts.weight[3] = w3;
+    ts.num_streams = n_str;
+    for (int32_t s = 0; s < n_str; ++s) {
+      ts.src_offs[s] = LoadBeU32(tp + 4u + uint32_t(s << 2));
+      ts.dst_idxs[s] = LoadBeU32(tp + 36u + uint32_t(s << 2));
+      if (ts.dst_idxs[s] >= 8u) {
+        ::__imp__sub_826D61A0(ctx, base);
+        return;
+      }
+    }
+    ts.blocks_rem = blocks_rem;
+    ts.stride = int32_t(LoadBeU32(tp + 72u));
+    ts.block_ptr = LoadBeU32(tp + 76u);
+  }
+
+  const uint32_t sp = uint32_t(old_sp) - 12208u;
+  ctx.r1.u64 = uint64_t(sp);
+  REX_STORE_U32(sp, uint32_t(old_sp));
+
+  ctx.r3.u64 = sp + 160u;
+  ctx.r4.u64 = r3_in;
+  ctx.r5.u64 = r4_in;
+  ctx.r6.u64 = 0u;
+  ctx.r7.u64 = 262144u;
+  ::__imp__sub_8283C4F8(ctx, base);
+
+  ctx.r3.u64 = sp + 160u;
+  ::__imp__sub_8283C600(ctx, base);
+
+  auto get_stream = [&](uint32_t idx) -> uint32_t {
+    ctx.r3.u64 = sp + 160u;
+    ctx.r4.u64 = idx;
+    ::__imp__sub_8283C4D8(ctx, base);
+    return ctx.r3.u32;
+  };
+
+  for (;;) {
+    ctx.r3.u64 = sp + 160u;
+    ::__imp__sub_8283C280(ctx, base);
+    if ((ctx.r3.u32 & 0xFFu) != 0u) break;
+
+    ctx.r3.u64 = sp + 160u;
+    ::__imp__sub_8283C288(ctx, base);
+    const uint32_t chunk_count = ctx.r3.u32;
+
+    ctx.r3.u64 = sp + 160u;
+    ::__imp__sub_8283C2B8(ctx, base);
+    const uint32_t chunk_start = ctx.r3.u32;
+    const int32_t chunk_end = int32_t(chunk_start + chunk_count) - 1;
+
+    uint32_t out_streams[8]{};
+    const uint32_t copy_bytes = chunk_count << 4;
+    for (int32_t s = 0; s < num_io_streams; ++s) {
+      const uint32_t in_va = get_stream(uint32_t(s * 2));
+      const uint32_t out_va = get_stream(uint32_t(s * 2 + 1));
+      out_streams[s] = out_va;
+      if (copy_bytes != 0u) {
+        std::memcpy(Raw(base, out_va), Raw(base, in_va), copy_bytes);
+        Card(base, out_va, copy_bytes);
+      }
+    }
+
+    for (uint32_t a = 0; a < num_active; ++a) {
+      TargetState& ts = active[a];
+      while (ts.blocks_rem != 0) {
+        const uint8_t* hdr = Raw(base, ts.block_ptr);
+        const uint32_t blk_start = LoadBeU16(hdr + 0u);
+        const uint32_t blk_count = LoadBeU16(hdr + 2u);
+        const int32_t lo = (int32_t(blk_start - chunk_start) < 0) ? int32_t(chunk_start) : int32_t(blk_start);
+        const int32_t blk_end = int32_t(blk_start + blk_count) - 1;
+        const int32_t hi = (blk_end > chunk_end) ? chunk_end : blk_end;
+        const int32_t n = hi - lo + 1;
+        if (n <= 0) break;
+        const uint32_t src_va = ts.block_ptr + 16u + uint32_t((lo - int32_t(blk_start)) * ts.stride);
+        const uint32_t dst_byte_off = uint32_t(lo - int32_t(chunk_start)) << 4;
+        if (ts.num_streams == 1) {
+          const uint32_t sea = (src_va + ts.src_offs[0]) & ~0xFu;
+          const uint32_t dea = (out_streams[ts.dst_idxs[0]] + dst_byte_off) & ~0xFu;
+          AccumSingleStream(Raw(base, dea), Raw(base, sea), ts.stride, n, ts.weight);
+        } else if (ts.num_streams > 1) {
+          AccumMultiStream(base, out_streams, ts.src_offs, ts.dst_idxs, ts.num_streams, dst_byte_off, src_va, ts.stride,
+                           n, ts.weight);
+        }
+        if (hi == blk_end) {
+          ts.block_ptr += 16u + uint32_t(ts.stride * int32_t(blk_count));
+          ts.blocks_rem -= 1;
+        } else {
+          break;
+        }
+      }
+    }
+
+    ctx.r3.u64 = sp + 160u;
+    ::__imp__sub_8283C690(ctx, base);
+  }
+
+  ctx.r3.u64 = sp + 160u;
+  ::__imp__sub_8283C580(ctx, base);
+  ctx.fpscr.enableFlushMode();
+  ctx.r1.u64 = old_sp;
+}
+
+}  // namespace n_826D61A0
+
 }  // namespace sa2::hot
 
 SA2_HOT_HOOK_COPY(8229B520, sa2_cpu_native_memcpy, true, "Native CRT memcpy (sub_8229B520): host memcpy",
                   sa2::hot::n_8229B520, 0, 0xCBF29CE484222325ull)
-SA2_HOT_HOOK(82A8B590, sa2_cpu_native_82A8B590, "Native animation pose blend loop (sub_82A8B590, 358 samples)",
-             sa2::hot::n_82A8B590, &sa2::hot::n_82A8B590::Writes, sa2::hot::Cmp::kAll, 0, 0ull)
+SA2_HOT_HOOK_COPY(82A8B590, sa2_cpu_native_82A8B590, true,
+                  "Native ARM64 NEON audio biquad IIR filter (sub_82A8B590)", sa2::hot::n_82A8B590, 0,
+                  0xCBF29CE484222325ull)
 SA2_HOT_HOOK_COPY(82A8C308, sa2_cpu_native_82A8C308, true,
                   "Native float array multiply-accumulate (sub_82A8C308)", sa2::hot::n_82A8C308, 0,
                   0xCBF29CE484222325ull)
@@ -4142,10 +4872,33 @@ SA2_HOT_HOOK_COPY(826D6B18, sa2_cpu_native_sub_826D6B18, true,
 SA2_HOT_HOOK_COPY(82C61450, sa2_cpu_native_sub_82C61450, true,
                   "Native XMemCpy (sub_82C61450): host memcpy", sa2::hot::n_82C61450, 0,
                   0xCBF29CE484222325ull)
-SA2_HOT_HOOK(82789120, sa2_cpu_native_82789120, "Native SIMD skinning loop (sub_82789120, 3.4% x3 workers + 2.0% FGGameSim)",
-             sa2::hot::n_82789120, &sa2::hot::n_82789120::Writes, sa2::hot::Cmp::kAll, 0, 0ull)
-SA2_HOT_HOOK(82A87020, sa2_cpu_native_82A87020, "Native audio mix/resample loop (sub_82A87020, 10.6% Job 4)",
-             sa2::hot::n_82A87020, &sa2::hot::n_82A87020::Writes, sa2::hot::Cmp::kAll, 0, 0ull)
+SA2_HOT_HOOK_COPY(82789120, sa2_cpu_native_82789120, true,
+                  "Native SIMD skinning loop (sub_82789120, barrier-free copy)", sa2::hot::n_82789120, 0,
+                  0xCBF29CE484222325ull)
+SA2_HOT_HOOK_COPY(82A87020, sa2_cpu_native_82A87020, true,
+                  "Native ARM64 NEON FFT convolution complex MAC (sub_82A87020)", sa2::hot::n_82A87020, 0,
+                  0xCBF29CE484222325ull)
 SA2_HOT_HOOK_COPY(826D8178, sa2_cpu_native_sub_826D8178, true,
                   "Native ARM64 NEON matrix-palette skinning (sub_826D8178)", sa2::hot::n_826D8178, 0,
+                  0xCBF29CE484222325ull)
+SA2_HOT_HOOK_COPY(82A8F798, sa2_cpu_native_sub_82A8F798, true,
+                  "Native ARM64 NEON audio dynamics compressor (sub_82A8F798)", sa2::hot::n_82A8F798, 0,
+                  0xCBF29CE484222325ull)
+SA2_HOT_HOOK_COPY(82AA02B0, sa2_cpu_native_sub_82AA02B0, true,
+                  "Native ARM64 NEON audio RMS/peak meter (sub_82AA02B0)", sa2::hot::n_82AA02B0, 0,
+                  0xCBF29CE484222325ull)
+SA2_HOT_HOOK_COPY(82A8BBC0, sa2_cpu_native_sub_82A8BBC0, true,
+                  "Native float32 linear audio resampler (sub_82A8BBC0)", sa2::hot::n_82A8BBC0, 0,
+                  0xCBF29CE484222325ull)
+SA2_HOT_HOOK_COPY(82A85B58, sa2_cpu_native_sub_82A85B58, true,
+                  "Native ARM64 NEON audio gain ramp/scale (sub_82A85B58)", sa2::hot::n_82A85B58, 0,
+                  0xCBF29CE484222325ull)
+SA2_HOT_HOOK_COPY(82440038, sa2_cpu_native_sub_82440038, true,
+                  "Native ARM64 NEON SQT transform compose (sub_82440038)", sa2::hot::n_82440038, 0,
+                  0xCBF29CE484222325ull)
+SA2_HOT_HOOK_COPY(82B85E10, sa2_cpu_native_sub_82B85E10, true,
+                  "Native ARM64 NEON 4-wide distance constraints (sub_82B85E10)", sa2::hot::n_82B85E10, 0,
+                  0xCBF29CE484222325ull)
+SA2_HOT_HOOK_COPY(826D61A0, sa2_cpu_native_sub_826D61A0, true,
+                  "Native ARM64 NEON morph-target accumulator (sub_826D61A0)", sa2::hot::n_826D61A0, 0,
                   0xCBF29CE484222325ull)

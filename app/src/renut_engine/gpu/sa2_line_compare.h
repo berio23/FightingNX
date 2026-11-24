@@ -39,4 +39,29 @@ inline bool Line64Differs(const uint8_t *a, const uint8_t *b, bool neon) {
   return Line64DiffersPlain(a, b);
 }
 
+// Compares a 64-byte device chunk against shadow; if it differs, writes the already-loaded 64 bytes
+// directly to both shadow and dst without re-reading src or calling out-of-line memcpy.
+inline bool Line64CompareAndCopy(const uint8_t *src, uint8_t *shadow, uint8_t *dst, bool neon) {
+#if defined(__aarch64__)
+  if (neon) {
+    const uint8x16x4_t x = vld1q_u8_x4(src);
+    const uint8x16x4_t y = vld1q_u8_x4(shadow);
+    const uint8x16_t d = vorrq_u8(vorrq_u8(veorq_u8(x.val[0], y.val[0]), veorq_u8(x.val[1], y.val[1])),
+                                  vorrq_u8(veorq_u8(x.val[2], y.val[2]), veorq_u8(x.val[3], y.val[3])));
+    if (vmaxvq_u32(vreinterpretq_u32_u8(d)) == 0)
+      return false;
+    vst1q_u8_x4(shadow, x);
+    vst1q_u8_x4(dst, x);
+    return true;
+  }
+#else
+  (void)neon;
+#endif
+  if (!Line64DiffersPlain(src, shadow))
+    return false;
+  std::memcpy(shadow, src, 64);
+  std::memcpy(dst, src, 64);
+  return true;
+}
+
 }  // namespace sa2::renut

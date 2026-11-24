@@ -361,6 +361,46 @@ constexpr DeltaChunkList MakeDeltaChunkList(bool narrow) {
 }
 constexpr DeltaChunkList kDeltaAllChunks = MakeDeltaChunkList(false);
 constexpr DeltaChunkList kDeltaReadChunks = MakeDeltaChunkList(true);
+
+// Precomputed flat table of full 64-byte chunks + optional tail chunk, avoiding per-chunk offset/size branches
+// in CaptureDelta's unmarked loop.
+struct DeltaChunkFlat {
+  struct Entry {
+    u16 offset = 0;
+    u8 word = 0;
+    u8 index = 0;
+    uint64_t bit = 0;
+  };
+  u32 full_count = 0;
+  Entry full[128] = {};
+  bool has_tail = false;
+  u16 tail_offset = 0;
+  u16 tail_size = 0;
+  u8 tail_word = 0;
+  u8 tail_index = 0;
+  uint64_t tail_bit = 0;
+};
+constexpr DeltaChunkFlat MakeDeltaChunkFlat(const DeltaChunkList &l) {
+  DeltaChunkFlat f{};
+  for (u32 k = 0; k < l.count; ++k) {
+    const u32 i = l.index[k];
+    const u32 at = DeltaChunkOffset(i);
+    const u32 sz = DeltaChunkSize(i);
+    if (sz == kDeltaUnitBytes) {
+      f.full[f.full_count++] = {u16(at), u8(i / 64), u8(i), uint64_t(1) << (i % 64)};
+    } else {
+      f.has_tail = true;
+      f.tail_offset = u16(at);
+      f.tail_size = u16(sz);
+      f.tail_word = u8(i / 64);
+      f.tail_index = u8(i);
+      f.tail_bit = uint64_t(1) << (i % 64);
+    }
+  }
+  return f;
+}
+constexpr DeltaChunkFlat kDeltaAllFlat = MakeDeltaChunkFlat(kDeltaAllChunks);
+constexpr DeltaChunkFlat kDeltaReadFlat = MakeDeltaChunkFlat(kDeltaReadChunks);
 #if !RENUT_GAME_FNC  // SA2's count; FNC's layout gives its own (the asserts above check the structure)
 static_assert(kDeltaReadChunks.count == 40);
 #endif
@@ -734,12 +774,15 @@ DrawCapture *CaptureDelta(u32 device_va, const DrawCall &call) {
     // Chunk i: compared with the shadow, and kept (in the shadow and the delta) when it differs.
     const auto compare = [&](u32 i) {
       const u32 at = DeltaChunkOffset(i), size = DeltaChunkSize(i);
-      const bool differs = size == kDeltaUnitBytes ? sa2::renut::Line64Differs(bytes + at, c.shadow + at, neon)
-                                                   : std::memcmp(bytes + at, c.shadow + at, size) != 0;
-      if (!differs)
-        return false;
-      std::memcpy(c.shadow + at, bytes + at, size);
-      std::memcpy(to, bytes + at, size);
+      if (size == kDeltaUnitBytes) {
+        if (!sa2::renut::Line64CompareAndCopy(bytes + at, c.shadow + at, to, neon))
+          return false;
+      } else {
+        if (std::memcmp(bytes + at, c.shadow + at, size) == 0)
+          return false;
+        std::memcpy(c.shadow + at, bytes + at, size);
+        std::memcpy(to, bytes + at, size);
+      }
       to += size;
       h.chunks[i / 64] |= uint64_t(1) << (i % 64);
       ++chunks;
@@ -801,11 +844,43 @@ DrawCapture *CaptureDelta(u32 device_va, const DrawCall &call) {
             compare(word * 64 + u32(std::countr_zero(bits)));
         c.compared += marked_count;
       }
+    } else if (!check) {
+      // Unmarked fast path (default on FNC): flat precomputed 64-byte chunk offsets with inline NEON compare+copy
+      // and no per-chunk offset/size/check branches or out-of-line memcpy calls.
+      const DeltaChunkFlat &flat = narrow ? kDeltaReadFlat : kDeltaAllFlat;
+      const u32 n = flat.full_count;
+      for (u32 k = 0; k < n; ++k) {
+        if (k + 2 < n) {
+          const u32 next_at = flat.full[k + 2].offset;
+          __builtin_prefetch(bytes + next_at);
+          __builtin_prefetch(c.shadow + next_at);
+        }
+        const auto &e = flat.full[k];
+        if (sa2::renut::Line64CompareAndCopy(bytes + e.offset, c.shadow + e.offset, to, neon)) {
+          to += kDeltaUnitBytes;
+          h.chunks[e.word] |= e.bit;
+          ++chunks;
+#if defined(SA2_D3D_CENSUS_BUILD)
+          sa2::d3d::CensusDrawChunk(e.offset, kDeltaUnitBytes);
+#endif
+        }
+      }
+      if (flat.has_tail && std::memcmp(bytes + flat.tail_offset, c.shadow + flat.tail_offset, flat.tail_size) != 0) {
+        std::memcpy(c.shadow + flat.tail_offset, bytes + flat.tail_offset, flat.tail_size);
+        std::memcpy(to, bytes + flat.tail_offset, flat.tail_size);
+        to += flat.tail_size;
+        h.chunks[flat.tail_word] |= flat.tail_bit;
+        ++chunks;
+#if defined(SA2_D3D_CENSUS_BUILD)
+        sa2::d3d::CensusDrawChunk(flat.tail_offset, flat.tail_size);
+#endif
+      }
+      c.compared += n + (flat.has_tail ? 1u : 0u);
     } else {
       const DeltaChunkList &list = narrow ? kDeltaReadChunks : kDeltaAllChunks;
       for (u32 k = 0; k < list.count; ++k) {
         const u32 i = list.index[k];
-        if (compare(i) && check && !(marked.w[i / 64] >> (i % 64) & 1)) {
+        if (compare(i) && !(marked.w[i / 64] >> (i % 64) & 1)) {
           // A change no mark named: the marks are off from here on (this draw keeps it, as every draw will). The
           // verify mode, which checks every draw and so never uses them, keeps counting instead.
           ++c.misses;

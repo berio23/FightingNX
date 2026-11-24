@@ -12,6 +12,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 
 #include <rex/assert.h>
@@ -129,13 +130,17 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
   // Default 5.1 channel mapping is fl, fr, fc, lf, bl, br
   // https://docs.microsoft.com/en-us/windows/win32/xaudio2/xaudio2-default-channel-mapping
   const float scale = fold.scale * gain;
+  const auto load_finite = [](float be_sample) -> float {
+    const float v = rex::byte_swap(be_sample);
+    return std::isfinite(v) ? v : 0.0f;
+  };
   for (size_t sample = 0; sample < ch_sample_count; sample++) {
-    const float fl = rex::byte_swap(input[0 * ch_sample_count + sample]);
-    const float fr = rex::byte_swap(input[1 * ch_sample_count + sample]);
-    const float fc = rex::byte_swap(input[2 * ch_sample_count + sample]);
-    const float lf = rex::byte_swap(input[3 * ch_sample_count + sample]);
-    const float bl = rex::byte_swap(input[4 * ch_sample_count + sample]);
-    const float br = rex::byte_swap(input[5 * ch_sample_count + sample]);
+    const float fl = load_finite(input[0 * ch_sample_count + sample]);
+    const float fr = load_finite(input[1 * ch_sample_count + sample]);
+    const float fc = load_finite(input[2 * ch_sample_count + sample]);
+    const float lf = load_finite(input[3 * ch_sample_count + sample]);
+    const float bl = load_finite(input[4 * ch_sample_count + sample]);
+    const float br = load_finite(input[5 * ch_sample_count + sample]);
     // Center and LFE land on both sides.
     const float mid = fc * fold.center + lf * fold.lfe;
     output[sample * 2] = std::clamp((fl + mid + bl * fold.surround) * scale, -1.0f, 1.0f);

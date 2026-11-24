@@ -377,12 +377,13 @@ bool XmaContext::Work() {
   }
 
   std::lock_guard<std::mutex> lock(lock_);
-  // The immediate work and the XMA thread may have seen the same notification.
-  // Only one must consume it; Disable/Release also use this lock.
-  if (!is_allocated() || !is_enabled()) {
+  // Atomically consume the enable flag: a concurrent lock-free Enable() either
+  // happens-before this exchange (so the load of XMA_CONTEXT_DATA below observes
+  // all guest updates) or happens-after it (leaving is_enabled_ true + pending
+  // bit set for the worker's next pass).
+  if (!is_allocated() || !is_enabled_.exchange(false, std::memory_order_acq_rel)) {
     return false;
   }
-  set_is_enabled(false);
 
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
   XMA_CONTEXT_DATA data(context_ptr);
@@ -435,7 +436,7 @@ bool XmaContext::Work() {
       static_cast<int32_t>(effective_sdc) + data.output_buffer_padding;
 
   if (minimum_subframe_decode_count > remaining_subframe_blocks_in_output_buffer_) {
-    StoreContextMerged(data, initial_data, context_ptr);
+    // Nothing in `data` changed; skip StoreContextMerged to avoid dirtying the guest cache line.
     NoteProduction(true, 0, data);  // output full, not silence
     return true;
   }
@@ -485,7 +486,8 @@ bool XmaContext::Work() {
 }
 
 void XmaContext::Enable() {
-  std::lock_guard<std::mutex> lock(lock_);
+  // Lock-free: the calling guest audio thread must never block on FFmpeg decode
+  // inside Work() when polling/re-enabling an active voice.
   set_is_enabled(true);
 }
 
@@ -786,7 +788,7 @@ void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
   fresh.input_buffer_read_offset = data.input_buffer_read_offset;
   fresh.error_status = data.error_status;
   fresh.current_buffer = data.current_buffer;
-  fresh.output_buffer_read_offset = data.output_buffer_read_offset;
+  // Preserve fresh.output_buffer_read_offset: only the guest advances the read offset.
 
   fresh.Store(context_ptr);
 }
@@ -926,8 +928,6 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
   uint8_t* current_input_buffer = GetCurrentInputBuffer(data);
 
-  input_buffer_.fill(0);
-
   // Loop-end frame: decode it here (output limited to loop_subframe_end),
   // jump to loop_start afterwards in the next-offset step.
   bool is_loop_end_frame = false;
@@ -1021,6 +1021,7 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     return;
   }
 
+  bool has_second_packet = false;
   if (packet_info.isLastFrameInPacket()) {
     if (stream.BitsRemaining() < packet_info.current_frame_size_) {
       const uint8_t* next_packet =
@@ -1035,20 +1036,26 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       }
       std::memcpy(input_buffer_.data() + kBytesPerPacketData, next_packet + kBytesPerPacketHeader,
                   kBytesPerPacketData);
+      has_second_packet = true;
     }
   }
 
   std::memcpy(input_buffer_.data(), packet + kBytesPerPacketHeader, kBytesPerPacketData);
+  if (!has_second_packet) {
+    // BitStream::Peek loads 8 bytes at a time; zero the overhang past packet 1 instead of 4 KB.
+    std::memset(input_buffer_.data() + kBytesPerPacketData, 0, 8);
+  }
 
   stream = BitStream(input_buffer_.data(), (kBitsPerPacket - kBitsPerPacketHeader) * 2);
   stream.SetOffset(relative_offset - kBitsPerPacketHeader);
 
-  xma_frame_.fill(0);
+  // Zero only the packet payload + FFmpeg AV_INPUT_BUFFER_PADDING_SIZE (64 B) instead of all 4 KB.
+  const size_t xma_clear_bytes = std::min(
+      xma_frame_.size(), size_t(1 + ((packet_info.current_frame_size_ + 15) / 8) + 64));
+  std::memset(xma_frame_.data(), 0, xma_clear_bytes);
 
   const uint32_t padding_start =
       static_cast<uint8_t>(stream.Copy(xma_frame_.data() + 1, packet_info.current_frame_size_));
-
-  raw_frame_.fill(0);
 
   if (PrepareDecoder(data->sample_rate, bool(data->is_stereo)) < 0) {
     data->error_status = 4;

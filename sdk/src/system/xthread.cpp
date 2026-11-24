@@ -50,9 +50,13 @@ REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
 
 #if REX_PLATFORM_SWITCH
-REXCVAR_DEFINE_INT32(fnc_audio_mixer_priority, REX_SWITCH_PRIO_GUEST - 1, "Audio",
-                     "Switch priority of the Fight Night Champion DAC mixer (lower is more urgent)")
-    .range(REX_SWITCH_PRIO_AUDIO, REX_SWITCH_PRIO_GUEST - 1)
+REXCVAR_DEFINE_INT32(fnc_audio_mixer_priority, REX_SWITCH_PRIO_PRESENT + 1, "Audio",
+                     "Switch priority of the Fight Night Champion DAC thread (RwAudioCore, lower is more urgent)")
+    .range(REX_SWITCH_PRIO_AUDIO, REX_SWITCH_PRIO_GUEST)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(fnc_audio_job_priority, REX_SWITCH_PRIO_PRESENT + 2, "Audio",
+                     "Switch priority of the Fight Night Champion audio DSP job thread (Job Thread 4, lower is more urgent)")
+    .range(REX_SWITCH_PRIO_PRESENT + 1, REX_SWITCH_PRIO_GUEST)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace {
@@ -65,6 +69,7 @@ std::atomic<int32_t> g_guest_core_preferred{-1};
 // guest thread, 1 the main thread, 2 another guest thread).
 std::atomic<uint32_t> g_guest_layout_gen{0};
 std::atomic<int32_t> g_guest_main_core{0};
+std::atomic<uint32_t> g_audio_job_thread_id{0};
 thread_local uint32_t t_layout_applied = 0;
 thread_local uint8_t t_guest_kind = 0;
 }  // namespace
@@ -76,27 +81,45 @@ namespace rex::system {
 // (a guest thread's own svcSetThreadCoreMask: it never waits for another thread). Called at every guest wait.
 void ApplyGuestCoreLayoutAtWait() {
 #if REX_PLATFORM_SWITCH
-  // fnc-nx (2026-11-21, the second console run): the game's mixer thread ("RwAudioCore Dac", about 5 % of a core) ran
-  // at the guest priority with the job threads, which fill all three cores in a fight: the mix came late and the fight
-  // crackled while the menus (cores not full) and the audio output (every buffer delivered) were clean. One step above
-  // the other guest threads, below the host's audio and presentation threads. Applied by the thread itself, as every
-  // priority here (Horizon's svcSetThreadPriority on the current thread).
-  if (XThread* self = XThread::GetCurrentThread();
-      self && self->audio_mixer_priority_pending_.exchange(false, std::memory_order_acq_rel)) {
-    const int priority = REXCVAR_GET(fnc_audio_mixer_priority);
-    const bool ok = RexSwitchSetCurrentThreadPriorityOk(priority);
-    REXSYS_INFO("[fnc] the game's audio mixer thread at priority {:#x}: {}", priority,
-                ok ? "set" : "FAILED");
-  }
+  XThread* self = XThread::GetCurrentThread();
+  const auto is_audio_job = [&]() {
+    return self && self->thread_id() != 0 &&
+           self->thread_id() == g_audio_job_thread_id.load(std::memory_order_acquire);
+  };
+
   const uint32_t gen = g_guest_layout_gen.load(std::memory_order_acquire);
-  if (gen == 0 || gen == t_layout_applied) return;
-  t_layout_applied = gen;
-  if (t_guest_kind == 1) {
-    const int core = g_guest_main_core.load(std::memory_order_relaxed);
-    RexSwitchSetCurrentThreadMask(core, 1ull << core);
-  } else if (t_guest_kind == 2) {
-    const uint32_t mask = g_guest_core_mask.load(std::memory_order_relaxed);
-    if (mask) RexSwitchSetCurrentThreadMask(g_guest_core_preferred.load(std::memory_order_relaxed), mask);
+  if (gen != 0 && gen != t_layout_applied) {
+    t_layout_applied = gen;
+    if (t_guest_kind == 1) {
+      const int core = g_guest_main_core.load(std::memory_order_relaxed);
+      RexSwitchSetCurrentThreadMask(core, 1ull << core);
+    } else if (t_guest_kind == 2) {
+      const uint32_t mask = g_guest_core_mask.load(std::memory_order_relaxed);
+      if (mask) {
+        const int preferred = is_audio_job() ? 2 : g_guest_core_preferred.load(std::memory_order_relaxed);
+        RexSwitchSetCurrentThreadMask(preferred, mask);
+      }
+    }
+  }
+
+  // fnc-nx: both the DAC coordinator ("RwAudioCore Dac", ~3% CPU) and its dedicated DSP job worker
+  // ("Job Thread 4", ~45% CPU in fights, 100% audio DSP) must run above the time-sliced 0x3B guest
+  // threads so they meet the 5.333 ms audio frame deadline when all 3 Switch cores saturate, while
+  // staying below host audio (0x2B) and the render thread (0x2C, pinned to core 1).
+  if (self && self->audio_mixer_priority_pending_.exchange(false, std::memory_order_acq_rel)) {
+    const bool audio_job = is_audio_job();
+    const int priority = audio_job ? REXCVAR_GET(fnc_audio_job_priority)
+                                   : REXCVAR_GET(fnc_audio_mixer_priority);
+    const bool ok = (priority == REX_SWITCH_PRIO_GUEST) ||
+                    RexSwitchSetCurrentThreadPriorityOk(priority);
+    if (audio_job) {
+      // Prefer core 2 (audout is on core 0, render thread is pinned to core 1); keep full 3-core mask.
+      RexSwitchSetCurrentThreadCore(2);
+    }
+    REXSYS_INFO("[fnc] {} at priority {:#x}: {}",
+                audio_job ? "the game's audio DSP job thread (Job Thread 4)"
+                          : "the game's audio mixer thread (RwAudioCore)",
+                priority, ok ? "set" : "FAILED");
   }
 #endif
 }
@@ -232,8 +255,14 @@ void XThread::set_name(const std::string_view name) {
   std::lock_guard<std::mutex> lock(thread_lock_);
   thread_name_ = fmt::format("{} ({:08X})", name, handle());
 #if REX_PLATFORM_SWITCH
-  if (guest_thread_ && name.starts_with("RwAudioCore"))
-    audio_mixer_priority_pending_.store(true, std::memory_order_release);
+  if (guest_thread_) {
+    if (name.starts_with("RwAudioCore")) {
+      audio_mixer_priority_pending_.store(true, std::memory_order_release);
+    } else if (name.starts_with("Job Thread 4")) {
+      g_audio_job_thread_id.store(thread_id_, std::memory_order_release);
+      audio_mixer_priority_pending_.store(true, std::memory_order_release);
+    }
+  }
 #endif
 
   if (thread_) {
@@ -524,6 +553,11 @@ X_STATUS XThread::Create() {
     rex::initialize_seh_thread();
 #if REX_PLATFORM_SWITCH
     RexSwitchSetCurrentThreadPriority(SwitchPriorityFor(guest_thread_, thread_name_));
+    if (!guest_thread_ && thread_name_.starts_with("XMA Decoder")) {
+      // Prefer core 2 (alongside Job Thread 4 audio DSP) to reduce cross-core cache traffic;
+      // keep the full 3-core mask so Horizon can still run it in parallel on another core.
+      RexSwitchSetCurrentThreadCore(2);
+    }
     // sa2-nx (2026-10-20): known to the pthread layer by its kernel handle, so another thread can set its cores
     // (RexSetGuestThreadCoreLayout: the registry was empty, and setting another thread's mask failed quietly).
     RexSwitchRegisterCurrentThread();

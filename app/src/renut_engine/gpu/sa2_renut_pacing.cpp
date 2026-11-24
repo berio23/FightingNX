@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <string>
 #include <thread>
 
@@ -55,6 +56,9 @@ REXCVAR_DEFINE_INT32(sa2_diag_swap_hold_every_s, 0, "SA2/Diagnostics",
 // The native renderer's relaxed vsync key (src/me/me_native_system.cpp), the player's setting.
 extern ::sa2::enh::Enhancement g_vsync_relaxed;
 REXCVAR_DECLARE(bool, sa2_vsync_relaxed);
+#if RENUT_GAME_FNC
+REXCVAR_DECLARE(double, fnc_frame_rate);
+#endif
 
 namespace sa2::renut {
 
@@ -177,7 +181,20 @@ void PaceSwap(uint32_t device_va) {
   static const bool on = REXCVAR_GET(sa2_renut_vblank_pacing);
   if (!on || !device_va) return;
   const auto *interval_word = ::renut::gpu::GuestPtr<const be_u32>(device_va + kDeviceOffsetPresentationInterval);
-  const uint32_t refreshes = RefreshesPerFrame(interval_word ? uint32_t(*interval_word) : 1);
+  uint32_t refreshes = RefreshesPerFrame(interval_word ? uint32_t(*interval_word) : 1);
+#if RENUT_GAME_FNC
+  // FNC sets D3DPRESENT_INTERVAL_ONE (60 Hz) even when its own render timer caps frames to fnc_frame_rate (30 Hz).
+  // Without accounting for fnc_frame_rate here, every 30 Hz frame arrives ~33.3 ms after the previous Swap and is
+  // misclassified as late against the 16.67 ms (1-refresh) grid, preventing banjo_display_sync from anchoring to vsync.
+  if (refreshes) {
+    const double rate = REXCVAR_GET(fnc_frame_rate);
+    if (rate >= 10.0 && rate < 60.0) {
+      const uint32_t cap_refreshes = uint32_t(std::lround(60.0 / rate));
+      if (cap_refreshes > refreshes)
+        refreshes = cap_refreshes;
+    }
+  }
+#endif
   const auto now = Clock::now();
   // sa2-nx (2026-10-28, sa2_renut_queue_drain): this release a refresh later, once, when the display thread asks
   // (double buffering's queue stuck one image deep: display_sync.h), or the test's timer does. The game's frame starts a

@@ -461,10 +461,10 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
 // bumps kListVersion; a file of another version is started over.
 
 constexpr char kListMagic[4] = {'R', 'N', 'P', 'L'};
-// banjo-nx: 2, the key's bool words (banjo_gpu_bool_spec); 3, output_trim; 4, alpha_func (a version 3 list is kept,
-// LoadList).
-constexpr u32 kListVersion = 4;
-constexpr u32 kListV3KeySize = 184;  // the key up to output_trim
+// banjo-nx: 2, the key's bool words (banjo_gpu_bool_spec); 3, output_trim; 4, alpha_func;
+// fnc-nx (2026-11-24): 5, plume::RenderFormat gained 6 vertex formats in 47a3ebd (shifting enum values >= 24),
+// invalidating v4 serialized color/depth/input_element formats (which caused "vertex element format 38 has no deko3d form").
+constexpr u32 kListVersion = 5;
 
 struct ListHeader {
   char magic[4];
@@ -573,6 +573,12 @@ bool DecodeRecord(const char *data, size_t size, Job &job) {
   if (!vs || (ps_hash && !ps))
     return false;  // a shader this build lacks
   job.key = stored;
+  if (job.key.color_count > d3d::kMaxRenderTargets || u32(job.key.depth_format) >= u32(plume::RenderFormat::MAX))
+    return false;
+  for (u32 i = 0; i < job.key.color_count; ++i) {
+    if (u32(job.key.color_formats[i]) >= u32(plume::RenderFormat::MAX))
+      return false;
+  }
   job.key.vertex_shader = vs;
   job.key.pixel_shader = ps;
   // banjo-nx (2026-10-20): the key as this configuration makes it. A record written with other keys on (Renut's blend
@@ -612,9 +618,11 @@ bool DecodeRecord(const char *data, size_t size, Job &job) {
         !r.Get(slot) || !r.Get(offset)) {
       return false;
     }
+    const auto fmt = plume::RenderFormat(format);
+    if (format == 0 || format >= u32(plume::RenderFormat::MAX) || plume::RenderFormatIsDepth(fmt))
+      return false;
     job.names.push_back(std::move(name));
-    job.layout.input_elements.emplace_back(job.names.back().c_str(), index, location,
-                                           plume::RenderFormat(format), slot, offset);
+    job.layout.input_elements.emplace_back(job.names.back().c_str(), index, location, fmt, slot, offset);
   }
   return true;
 }
@@ -709,26 +717,13 @@ std::vector<std::unique_ptr<Job>> LoadList() {
   const bool header_ok = bytes.size() >= sizeof(header) && std::memcmp(header.magic, kListMagic, 4) == 0 &&
                          header.streams == kMaxVertexStreams;
   const bool valid = header_ok && header.version == kListVersion && header.key_size == sizeof(PipelineKey);
-  // banjo-nx (2026-10-18): a version 3 list (before alpha_func): its keys get the fields after output_trim as 0 (the
-  // generic pipelines, which the specialised ones draw with until they are built), and the file is written again as
-  // version 4.
-  const bool v3 = header_ok && header.version == 3 && header.key_size == kListV3KeySize;
-  if (!valid && !v3) {
+  if (!valid) {
     std::error_code ec;
     std::filesystem::remove(path, ec);
     return jobs;
   }
   std::unordered_set<uint64_t> seen;
-  std::vector<char> converted;
-  if (v3) {
-    ListHeader h4 = header;
-    h4.version = kListVersion;
-    h4.key_size = sizeof(PipelineKey);
-    converted.resize(sizeof(h4));
-    std::memcpy(converted.data(), &h4, sizeof(h4));
-  }
   size_t at = sizeof(header);
-  std::vector<char> record;
   while (bytes.size() - at >= sizeof(u32)) {
     u32 size;
     std::memcpy(&size, bytes.data() + at, sizeof(size));
@@ -736,31 +731,10 @@ std::vector<std::unique_ptr<Job>> LoadList() {
     if (bytes.size() - at < size)
       break;  // cut short (the game closed while writing)
     const char *data = bytes.data() + at;
-    u32 data_size = size;
-    if (v3) {
-      if (size < kListV3KeySize)
-        break;
-      record.assign(data, data + kListV3KeySize);
-      record.resize(sizeof(PipelineKey), 0);
-      record.insert(record.end(), data + kListV3KeySize, data + size);
-      data = record.data();
-      data_size = u32(record.size());
-      const size_t o = converted.size();
-      converted.resize(o + sizeof(u32) + data_size);
-      std::memcpy(converted.data() + o, &data_size, sizeof(u32));
-      std::memcpy(converted.data() + o + sizeof(u32), data, data_size);
-    }
     auto job = std::make_unique<Job>();
-    if (DecodeRecord(data, data_size, *job) && seen.insert(job->hash).second)
+    if (DecodeRecord(data, size, *job) && seen.insert(job->hash).second)
       jobs.push_back(std::move(job));
     at += size;
-  }
-  if (v3) {
-    std::ofstream rewrite(path, std::ios::binary | std::ios::trunc);
-    if (rewrite)
-      rewrite.write(converted.data(), std::streamsize(converted.size()));
-    RGPU_INFO("Pipeline list {}: version 3, {} pipelines kept as version 4 (generic alpha test)", path.string(),
-              jobs.size());
   }
   // Records of shaders this build lacks stay out of 'listed': a later build
   // that has them lists the pipelines again.

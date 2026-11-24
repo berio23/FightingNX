@@ -228,23 +228,22 @@ int64_t NowNs() {
 }
 
 void MarkPending(uint32_t context_id) {
-  g_pending[context_id / 32].fetch_or(1u << (context_id % 32), std::memory_order_release);
+  g_pending[context_id / 32].fetch_or(1u << (context_id % 32), std::memory_order_seq_cst);
 }
 
 // Returns true if this thread takes the context; only one can.
 bool TakePending(uint32_t context_id) {
   const uint32_t bit = 1u << (context_id % 32);
-  return (g_pending[context_id / 32].fetch_and(~bit, std::memory_order_acquire) & bit) != 0;
+  return (g_pending[context_id / 32].fetch_and(~bit, std::memory_order_acq_rel) & bit) != 0;
 }
 
-int64_t NowMsXma() {
-  using namespace std::chrono;
-  return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
-}
-
-uint64_t FromNs(const std::chrono::steady_clock::time_point& before) {
-  using namespace std::chrono;
-  return uint64_t(duration_cast<nanoseconds>(steady_clock::now() - before).count());
+bool HasAnyPending() {
+  for (uint32_t word = 0; word < kPendingWords; ++word) {
+    if (g_pending[word].load(std::memory_order_seq_cst) != 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void MaxXma(std::atomic<uint64_t>& max, uint64_t value) {
@@ -253,8 +252,8 @@ void MaxXma(std::atomic<uint64_t>& max, uint64_t value) {
   }
 }
 
-void ReportXma() {
-  const int64_t now = NowMsXma();
+void ReportXma(int64_t now_ns) {
+  const int64_t now = now_ns / 1'000'000;
   int64_t last = g_measurement_xma.last_ms.load(std::memory_order_relaxed);
   if (last == 0) {
     g_measurement_xma.last_ms.compare_exchange_strong(last, now, std::memory_order_relaxed);
@@ -295,11 +294,10 @@ void ReportXma() {
 
 void XmaDecoder::WorkerThreadMain() {
   while (worker_running_) {
-    // Okay, let's loop through XMA contexts to find ones we need to decode!
+    // Drain all pending contexts kicked via WriteRegister without touching idle contexts.
+    // Previously, `if (did_work) continue;` caused a second pass with `pending_was == false`,
+    // which swept all 320 contexts (~32% of XMA Decoder CPU) after every single kick.
     bool did_work = false;
-    // First the ones a kick has just enabled: they are reached without walking all 320 or touching their
-    // locks.
-    bool pending_was = false;
     for (uint32_t word = 0; word < kPendingWords && worker_running_; ++word) {
       uint32_t bits = g_pending[word].load(std::memory_order_acquire);
       uint32_t index = 0;
@@ -307,45 +305,28 @@ void XmaDecoder::WorkerThreadMain() {
         const uint32_t n = word * 32 + index;
         bits &= ~(1u << index);
         if (!TakePending(n)) {
-          continue;  // the kick thread took it (mode 2)
+          continue;  // the kick thread took it (mode 2) or Disable cleared it
         }
-        pending_was = true;
-        const auto before = std::chrono::steady_clock::now();
+        const int64_t before_ns = NowNs();
         XmaContext& context = contexts_[n];
         const bool worked = context.Work();
-        const uint64_t ns = FromNs(before);
+        const int64_t after_ns = NowNs();
+        const uint64_t ns = after_ns > before_ns ? uint64_t(after_ns - before_ns) : 0;
         if (worked) {
           context.SignalWorkDone();
           PROFILE_XMA_FRAME_DECODED();
           g_measurement_xma.contexts_worker.fetch_add(1, std::memory_order_relaxed);
           g_measurement_xma.work_ns.fetch_add(ns, std::memory_order_relaxed);
           MaxXma(g_measurement_xma.work_max_ns, ns);
+          const int64_t from = g_pending_from_ns.load(std::memory_order_acquire);
+          if (from && after_ns >= from) {
+            const uint64_t latency = uint64_t(after_ns - from);
+            g_measurement_xma.latency_ns.fetch_add(latency, std::memory_order_relaxed);
+            g_measurement_xma.latency_n.fetch_add(1, std::memory_order_relaxed);
+            MaxXma(g_measurement_xma.latency_max_ns, latency);
+          }
+          did_work = true;
         }
-        did_work = did_work || worked;
-      }
-    }
-    if (pending_was) {
-      // From the kick to the data being written: the latency the game could notice.
-      const int64_t from = g_pending_from_ns.load(std::memory_order_acquire);
-      if (from) {
-        const uint64_t latency = uint64_t(NowNs() - from);
-        g_measurement_xma.latency_ns.fetch_add(latency, std::memory_order_relaxed);
-        g_measurement_xma.latency_n.fetch_add(1, std::memory_order_relaxed);
-        MaxXma(g_measurement_xma.latency_max_ns, latency);
-      }
-    }
-    // Full sweep as a safety net: it is how it used to work, and it serves any context left enabled
-    // without a mark. Only when there were no pending ones, so the 320 locks are not walked after every
-    // kick and the fast loop keeps the work being counted.
-    if (!pending_was) {
-      for (uint32_t n = 0; n < kContextCount && worker_running_; n++) {
-        XmaContext& context = contexts_[n];
-        bool worked = context.Work();
-        if (worked) {
-          context.SignalWorkDone();
-          PROFILE_XMA_FRAME_DECODED();
-        }
-        did_work = did_work || worked;
       }
     }
 
@@ -357,8 +338,16 @@ void XmaDecoder::WorkerThreadMain() {
     if (did_work) {
       continue;
     }
-    // No work done this iteration, block until signaled.
+
+    // Dekker publish-before-sleep: only let producers call work_event_->Set() when we are
+    // actually going to block, avoiding thousands of redundant mutex/condvar syscalls per second.
+    worker_sleeping_.store(true, std::memory_order_seq_cst);
+    if (HasAnyPending() || !worker_running_ || paused_) {
+      worker_sleeping_.store(false, std::memory_order_relaxed);
+      continue;
+    }
     rex::thread::Wait(work_event_.get(), false);
+    worker_sleeping_.store(false, std::memory_order_relaxed);
   }
 }
 
@@ -504,58 +493,61 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
      * notifications but polls the context sleeping 50 us per iteration, finds the data already written.
      */
     const int32_t worker_mode = REXCVAR_GET(audio_xma_in_worker);
-    const auto kick_before = std::chrono::steady_clock::now();
+    const int64_t kick_before_ns = NowNs();
     uint64_t kick_contexts = 0;
     if (worker_mode != 0) {
+      g_pending_from_ns.store(kick_before_ns, std::memory_order_release);
       uint32_t marked = kicked_value;
       for (int i = 0; marked && i < 32; ++i, marked >>= 1) {
         if (marked & 1) {
           MarkPending(base_context_id + i);
         }
       }
-      g_pending_from_ns.store(NowNs(), std::memory_order_release);
-      work_event_->Set();
+      if (worker_sleeping_.load(std::memory_order_seq_cst) &&
+          worker_sleeping_.exchange(false, std::memory_order_seq_cst)) {
+        work_event_->Set();
+      }
     }
-    for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
-      if (kicked_value & 1) {
-        uint32_t context_id = base_context_id + i;
-        auto& context = contexts_[context_id];
-        // Mode 1: the worker does everything. Mode 2: only what the worker has not already taken is
-        // finished here, without waiting for it (useful on the PC, where it has priority over nobody).
-        if (worker_mode == 1) {
-          continue;
-        }
-        if (worker_mode == 2 && !TakePending(context_id)) {
-          continue;  // the worker has taken it
-        }
-        ++kick_contexts;
-        if (worker_mode != 0) {
-          g_measurement_xma.contexts_backup.fetch_add(1, std::memory_order_relaxed);
-        }
-        if (context.Work()) {
-          context.SignalWorkDone();
+    if (worker_mode != 1) {
+      for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
+        if (kicked_value & 1) {
+          uint32_t context_id = base_context_id + i;
+          auto& context = contexts_[context_id];
+          // Mode 0: synchronous decode here. Mode 2: only what the worker has not already taken.
+          if (worker_mode == 2 && !TakePending(context_id)) {
+            continue;  // the worker has taken it
+          }
+          ++kick_contexts;
+          if (worker_mode != 0) {
+            g_measurement_xma.contexts_backup.fetch_add(1, std::memory_order_relaxed);
+          }
+          if (context.Work()) {
+            context.SignalWorkDone();
+          }
         }
       }
     }
     // Measurement only: how much decoding right here costs the thread requesting the kick.
-    const uint64_t kick_ns = FromNs(kick_before);
+    const int64_t kick_after_ns = NowNs();
+    const uint64_t kick_ns = kick_after_ns > kick_before_ns ? uint64_t(kick_after_ns - kick_before_ns) : 0;
     g_measurement_xma.kicks.fetch_add(1, std::memory_order_relaxed);
     g_measurement_xma.kick_contexts.fetch_add(kick_contexts, std::memory_order_relaxed);
     g_measurement_xma.kick_ns.fetch_add(kick_ns, std::memory_order_relaxed);
     MaxXma(g_measurement_xma.kick_max_ns, kick_ns);
-    ReportXma();
+    ReportXma(kick_after_ns);
   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
     // Context lock command.
     // This requests a lock by flagging the context.
     // XMADisableContext
     uint32_t base_context_id = (r - XmaRegister::Context0Lock) * 32;
-    const auto lock_before = std::chrono::steady_clock::now();
+    const int64_t lock_before_ns = NowNs();
     uint64_t lock_contexts = 0;
     for (int i = 0; value && i < 32; ++i, value >>= 1) {
       if (value & 1) {
         uint32_t context_id = base_context_id + i;
         auto& context = contexts_[context_id];
         ++lock_contexts;
+        TakePending(context_id);
         context.Disable();
         // [XMA fix] Added Block(false) after Disable(). Without this, the game
         // could call XMADisableContext and start modifying the context struct
@@ -566,12 +558,13 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     }
     // Measurement only: how long the thread requesting the lock waits for the worker to release the
     // context.
-    const uint64_t lock_ns = FromNs(lock_before);
+    const int64_t lock_after_ns = NowNs();
+    const uint64_t lock_ns = lock_after_ns > lock_before_ns ? uint64_t(lock_after_ns - lock_before_ns) : 0;
     g_measurement_xma.locks.fetch_add(1, std::memory_order_relaxed);
     g_measurement_xma.lock_contexts.fetch_add(lock_contexts, std::memory_order_relaxed);
     g_measurement_xma.lock_ns.fetch_add(lock_ns, std::memory_order_relaxed);
     MaxXma(g_measurement_xma.lock_max_ns, lock_ns);
-    ReportXma();
+    ReportXma(lock_after_ns);
     // Signal the decoder thread to start processing.
     // work_event_->Set();
   } else if (r >= XmaRegister::Context0Clear && r <= XmaRegister::Context9Clear) {
@@ -582,6 +575,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       if (value & 1) {
         uint32_t context_id = base_context_id + i;
         XmaContext& context = contexts_[context_id];
+        TakePending(context_id);
         context.Clear();
       }
     }

@@ -403,16 +403,17 @@ uint64_t NextRelease(uint64_t now, uint64_t previous, uint64_t frame_ns, bool *a
     return 0;
   const uint64_t refreshes = std::max<uint64_t>(1, uint64_t(std::llround(double(frame_ns) / double(period))));
   const uint64_t frame = refreshes * period;
-  // A frame that ended after its time: at once, as the timer did (no waiting for a later refresh: no 20 fps).
-  if (previous && now >= previous + frame)
-    return now;
   // The first refresh plus the phase at or after both now and half a refresh before the frame's time (the previous
   // release was a refresh plus the phase too, or a late one: the grid is found again here).
+  // Check lateness against the snapped display target rather than raw `previous + frame`, so tiny vsync jitter or a
+  // phase step-up does not prematurely un-anchor an on-time frame, while a genuinely late frame still releases at once.
   const uint64_t phase = g_phase.load(std::memory_order_relaxed);
   const uint64_t earliest = std::max(now, previous ? previous + frame - period / 2 : now);
   const int64_t from = int64_t(earliest) - int64_t(vsync + phase);
   const int64_t n = from <= 0 ? -((-from) / int64_t(period)) : (from + int64_t(period) - 1) / int64_t(period);
   const int64_t at = int64_t(vsync + phase) + n * int64_t(period);
+  if (previous && (at > int64_t(previous + frame + period / 2) || int64_t(now) > at))
+    return now;
   const uint64_t release = uint64_t(std::max<int64_t>(at, int64_t(now)));
   const uint64_t wait = release - now;
   if (wait > g_release_wait_max_ns.load(std::memory_order_relaxed))

@@ -1,15 +1,10 @@
 # Top FNC fight guest functions from run010 profile (bulk localized copies)
-82A8F798 fight pc=726
-82B85E10 fight pc=353
 82547D50 fight pc=324
 8277EE80 fight pc=299
-82440038 fight pc=297
-826D61A0 fight pc=282
 82B854D8 fight pc=236
 82785860 fight pc=203
 82772DE0 fight pc=189
 828390C8 fight pc=180
-82A8BBC0 fight pc=178
 8277F418 fight pc=178
 82773CF8 fight pc=172
 82C2FCF8 fight pc=171
@@ -26,10 +21,8 @@
 824E3270 fight pc=122
 824E1370 fight pc=118
 828393F0 fight pc=115
-82AA02B0 fight pc=112
 8257C798 fight pc=109
 82A87D08 fight pc=108
-82A85B58 fight pc=103
 82569900 fight pc=99
 8276F890 fight pc=99
 82B7A648 fight pc=99
